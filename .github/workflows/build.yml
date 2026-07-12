@@ -23,7 +23,7 @@ jobs:
       packages: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Log in to GHCR
         # No login on PRs — those builds don't push (and fork PRs lack the token).
