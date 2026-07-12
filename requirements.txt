@@ -1,0 +1,9 @@
+# Official MCP Python SDK (pulls in starlette + uvicorn used by server.py).
+# Loose lower bound so Dependabot can propose upgrades.
+mcp>=1.28.1
+# CalDAV client — WebDAV + iCalendar over HTTP; talks to iCloud and other servers.
+caldav>=1.3.9
+# iCalendar object model used to build and parse VEVENTs.
+icalendar>=5.0.11
+# JWT verification of Pomerium's identity assertion (ES256 needs cryptography).
+pyjwt[crypto]>=2.8.0
