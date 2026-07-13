@@ -87,28 +87,31 @@ PORT = int(os.environ.get("PORT", "8080"))
 
 mcp = FastMCP("caldav-mcp", host=HOST, port=PORT)
 
-_principal = None  # lazily constructed caldav.Principal (caches the DAV session)
-
 
 def _get_principal() -> "caldav.Principal":
-    """Return a cached CalDAV principal, opening the session on first use.
+    """Open a fresh CalDAV session and return its principal.
+
+    A new DAVClient is built per call rather than cached for the process
+    lifetime. A long-lived client's pooled HTTPS connection to iCloud can go
+    stale, so a later REPORT (e.g. a calendar-query for list_events) hangs until
+    the read timeout even though a fresh connection answers in a fraction of a
+    second. Discovery is cheap, so this trades a negligible per-call cost for
+    robustness — and avoids sharing one requests.Session across the server's
+    worker threads.
 
     Raises RuntimeError if credentials are missing (before any network I/O).
     """
-    global _principal
-    if _principal is None:
-        if not (CALDAV_USERNAME and CALDAV_PASSWORD):
-            raise RuntimeError(
-                "CALDAV_USERNAME and CALDAV_PASSWORD must be configured to reach CalDAV."
-            )
-        client = caldav.DAVClient(
-            url=CALDAV_URL,
-            username=CALDAV_USERNAME,
-            password=CALDAV_PASSWORD,
-            timeout=CALDAV_TIMEOUT,
+    if not (CALDAV_USERNAME and CALDAV_PASSWORD):
+        raise RuntimeError(
+            "CALDAV_USERNAME and CALDAV_PASSWORD must be configured to reach CalDAV."
         )
-        _principal = client.principal()
-    return _principal
+    client = caldav.DAVClient(
+        url=CALDAV_URL,
+        username=CALDAV_USERNAME,
+        password=CALDAV_PASSWORD,
+        timeout=CALDAV_TIMEOUT,
+    )
+    return client.principal()
 
 
 def _calendar_name(cal: "caldav.Calendar") -> str:
