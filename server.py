@@ -99,6 +99,18 @@ def _get_principal() -> "caldav.Principal":
     return _principal
 
 
+def _calendar_name(cal: "caldav.Calendar") -> str:
+    """Return a calendar's display name across caldav versions.
+
+    caldav 3.x deprecated the `.name` attribute in favour of
+    `get_display_name()`; fall back to `.name` on older releases.
+    """
+    getter = getattr(cal, "get_display_name", None)
+    if getter is not None:
+        return getter() or ""
+    return cal.name or ""
+
+
 def _resolve_calendar(name: str | None) -> "caldav.Calendar":
     """Resolve a calendar by display name, enforcing the allowlist and default.
 
@@ -117,7 +129,7 @@ def _resolve_calendar(name: str | None) -> "caldav.Calendar":
         )
 
     for cal in _get_principal().calendars():
-        if (cal.name or "") == target:
+        if _calendar_name(cal) == target:
             return cal
     raise ValueError(f"Calendar {target!r} was not found in the account.")
 
@@ -183,7 +195,7 @@ def list_calendars() -> str:
     """
     result = []
     for cal in _get_principal().calendars():
-        name = cal.name or ""
+        name = _calendar_name(cal)
         if ALLOWED_CALENDARS and name not in ALLOWED_CALENDARS:
             continue
         result.append({"name": name, "url": str(cal.url)})
@@ -281,7 +293,7 @@ def create_event(
     ical.add_component(vevent)
 
     cal.save_event(ical.to_ical().decode("utf-8"))
-    return f"Event created in {cal.name!r} with UID {uid}."
+    return f"Event created in {_calendar_name(cal)!r} with UID {uid}."
 
 
 @mcp.tool()
@@ -333,7 +345,7 @@ def update_event(
 
     event.data = ical.to_ical()
     event.save()
-    return f"Event {uid} updated in {cal.name!r}."
+    return f"Event {uid} updated in {_calendar_name(cal)!r}."
 
 
 @mcp.tool()
@@ -351,7 +363,7 @@ def delete_event(uid: str, calendar: str | None = None) -> str:
     _require_writable()
     cal = _resolve_calendar(calendar)
     cal.event_by_uid(uid).delete()
-    return f"Event {uid} deleted from {cal.name!r}."
+    return f"Event {uid} deleted from {_calendar_name(cal)!r}."
 
 
 def _run_startup_test() -> None:
@@ -374,7 +386,7 @@ def _run_startup_test() -> None:
             exc,
         )
         return
-    names = [c.name or "<unnamed>" for c in calendars]
+    names = [_calendar_name(c) or "<unnamed>" for c in calendars]
     logger.info("Startup CalDAV check OK — %d calendar(s): %s", len(names), ", ".join(names))
 
 
