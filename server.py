@@ -46,6 +46,15 @@ ALLOWED_CALENDARS = [
 ]
 # When true, writing tools (create/update/delete) are refused — a read-only mode.
 READ_ONLY = os.environ.get("READ_ONLY", "false").lower() == "true"
+# Per-request network timeout (seconds) for CalDAV calls. Without this the client
+# waits indefinitely on a slow iCloud REPORT, so the fronting proxy eventually
+# kills the connection and the caller sees a 502 instead of a clean tool error.
+# Keep it comfortably below the proxy's gateway timeout.
+CALDAV_TIMEOUT = int(os.environ.get("CALDAV_TIMEOUT", "20"))
+# Expand recurring events server-side so each occurrence appears on its real date
+# within the window. iCloud's expand support is uneven; list_events falls back to
+# an unexpanded query when expansion errors. Set to `false` to skip expand entirely.
+EXPAND_RECURRENCES = os.environ.get("EXPAND_RECURRENCES", "true").lower() == "true"
 
 # Optional app-layer backstop. The external proxy is still REQUIRED regardless.
 # When enabled, /mcp requests must carry a Pomerium identity assertion whose JWT
@@ -93,7 +102,10 @@ def _get_principal() -> "caldav.Principal":
                 "CALDAV_USERNAME and CALDAV_PASSWORD must be configured to reach CalDAV."
             )
         client = caldav.DAVClient(
-            url=CALDAV_URL, username=CALDAV_USERNAME, password=CALDAV_PASSWORD
+            url=CALDAV_URL,
+            username=CALDAV_USERNAME,
+            password=CALDAV_PASSWORD,
+            timeout=CALDAV_TIMEOUT,
         )
         _principal = client.principal()
     return _principal
@@ -112,26 +124,41 @@ def _calendar_name(cal: "caldav.Calendar") -> str:
 
 
 def _resolve_calendar(name: str | None) -> "caldav.Calendar":
-    """Resolve a calendar by display name, enforcing the allowlist and default.
+    """Resolve a calendar by display name *or* URL, enforcing the allowlist.
 
-    Raises ValueError when no calendar is selected/found or the name is not
-    permitted; everything here happens *before* the mutating network call.
+    `target` may be a calendar URL (as returned by `list_calendars`) — this
+    disambiguates accounts with duplicate display names (e.g. two "Family"
+    calendars). Otherwise it is matched by display name. The allowlist is checked
+    against the resolved calendar's name. Raises ValueError when no calendar is
+    selected/found or it is not permitted — all *before* any mutating call.
     """
     target = (name or DEFAULT_CALENDAR).strip()
     if not target:
         raise ValueError("No calendar: pass `calendar` or set DEFAULT_CALENDAR.")
 
+    calendars = _get_principal().calendars()
+    match = None
+    if target.startswith(("http://", "https://")):
+        for cal in calendars:
+            if str(cal.url).rstrip("/") == target.rstrip("/"):
+                match = cal
+                break
+    if match is None:
+        for cal in calendars:
+            if _calendar_name(cal) == target:
+                match = cal
+                break
+    if match is None:
+        raise ValueError(f"Calendar {target!r} was not found in the account.")
+
     # Calendar hard-limit: even a misused tool cannot touch calendars off the list.
-    if ALLOWED_CALENDARS and target not in ALLOWED_CALENDARS:
+    resolved = _calendar_name(match)
+    if ALLOWED_CALENDARS and resolved not in ALLOWED_CALENDARS:
         raise ValueError(
-            f"Calendar {target!r} is not permitted. "
+            f"Calendar {resolved!r} is not permitted. "
             f"Allowed calendars: {', '.join(ALLOWED_CALENDARS)}."
         )
-
-    for cal in _get_principal().calendars():
-        if _calendar_name(cal) == target:
-            return cal
-    raise ValueError(f"Calendar {target!r} was not found in the account.")
+    return match
 
 
 def _require_writable() -> None:
@@ -162,9 +189,8 @@ def _isoformat(value) -> str | None:
     return dt.isoformat() if hasattr(dt, "isoformat") else str(dt)
 
 
-def _summarize_event(event: "caldav.Event") -> dict:
-    """Extract the interesting fields of an event's VEVENT into a plain dict."""
-    comp = event.icalendar_component
+def _summarize_component(comp) -> dict:
+    """Extract the interesting fields of a single VEVENT into a plain dict."""
     return {
         "uid": str(comp.get("uid", "")),
         "summary": str(comp.get("summary", "")),
@@ -173,6 +199,39 @@ def _summarize_event(event: "caldav.Event") -> dict:
         "location": str(comp["location"]) if "location" in comp else None,
         "description": str(comp["description"]) if "description" in comp else None,
     }
+
+
+def _summarize_event(event: "caldav.Event") -> dict:
+    """Summarize an event's first VEVENT (used for single-event lookups)."""
+    return _summarize_component(event.icalendar_component)
+
+
+def _search_events(cal: "caldav.Calendar", start_dt, end_dt) -> list:
+    """Return all VEVENT occurrences in [start, end) as summary dicts.
+
+    Prefers server-side recurrence expansion so recurring events appear on their
+    real dates; iCloud's expand support is uneven, so this falls back to an
+    unexpanded query when expansion errors. Each returned event may carry more
+    than one VEVENT (expanded occurrences / overrides), so all are flattened.
+    """
+    events = None
+    if EXPAND_RECURRENCES:
+        try:
+            events = cal.search(start=start_dt, end=end_dt, event=True, expand=True)
+        except Exception as exc:
+            logger.warning(
+                "Expanded event search failed (%s: %s); retrying without expansion.",
+                type(exc).__name__,
+                exc,
+            )
+    if events is None:
+        events = cal.search(start=start_dt, end=end_dt, event=True, expand=False)
+
+    summaries = []
+    for event in events:
+        for vevent in event.icalendar_instance.walk("VEVENT"):
+            summaries.append(_summarize_component(vevent))
+    return summaries
 
 
 def _set_prop(vevent: IEvent, name: str, value) -> None:
@@ -209,20 +268,19 @@ def list_events(start: str, end: str, calendar: str | None = None) -> str:
     Args:
         start: Window start as an ISO 8601 date/datetime (inclusive).
         end: Window end as an ISO 8601 date/datetime (exclusive).
-        calendar: Calendar display name. Falls back to DEFAULT_CALENDAR when
-            omitted. Must be in ALLOWED_CALENDARS when one is configured.
+        calendar: Calendar display name *or* URL. Falls back to DEFAULT_CALENDAR
+            when omitted. Must resolve to a calendar in ALLOWED_CALENDARS when one
+            is configured. Pass the URL from `list_calendars` to disambiguate
+            accounts that have two calendars with the same display name.
 
     Returns:
         A JSON array of events (uid, summary, start, end, location, description).
     """
     cal = _resolve_calendar(calendar)
-    events = cal.search(
-        start=_parse_dt(start, all_day=False),
-        end=_parse_dt(end, all_day=False),
-        event=True,
-        expand=True,
+    summaries = _search_events(
+        cal, _parse_dt(start, all_day=False), _parse_dt(end, all_day=False)
     )
-    return json.dumps([_summarize_event(e) for e in events])
+    return json.dumps(summaries)
 
 
 @mcp.tool()
