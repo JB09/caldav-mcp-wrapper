@@ -126,6 +126,30 @@ def _calendar_name(cal: "caldav.Calendar") -> str:
     return cal.name or ""
 
 
+def _supported_components(cal: "caldav.Calendar") -> list[str]:
+    """Return the collection's advertised component types, e.g. ['VEVENT'] for an
+    event calendar or ['VTODO'] for a Reminders/task list.
+
+    iCloud (and CalDAV generally) exposes Reminders lists as collections
+    alongside calendars; this is how they are told apart. Best-effort: returns []
+    when the server does not advertise a `supported-calendar-component-set`.
+    """
+    try:
+        comps = cal.get_supported_components(with_fallback=False)
+    except Exception:
+        return []
+    return [str(c) for c in comps] if comps else []
+
+
+def _calendar_kind(components: list[str]) -> str:
+    """Classify a collection from its component set: event calendar vs task list."""
+    if "VEVENT" in components:
+        return "calendar"
+    if "VTODO" in components:
+        return "tasks"
+    return "unknown"
+
+
 def _resolve_calendar(name: str | None) -> "caldav.Calendar":
     """Resolve a calendar by display name *or* URL, enforcing the allowlist.
 
@@ -248,19 +272,45 @@ def _set_prop(vevent: IEvent, name: str, value) -> None:
 
 
 @mcp.tool()
-def list_calendars() -> str:
-    """List the calendars available in the connected CalDAV account.
+def list_calendars(kind: str = "calendar") -> str:
+    """List the collections available in the connected CalDAV account.
+
+    CalDAV (including iCloud) exposes Reminders/task lists as collections
+    alongside real event calendars. Each entry reports its `kind` so they can be
+    told apart: "calendar" (holds events, VEVENT), "tasks" (a Reminders list,
+    VTODO), or "unknown".
+
+    Args:
+        kind: Which collections to return — "calendar" (default; only event
+            calendars, what you almost always want), "tasks" (only Reminders
+            lists), or "all".
 
     Returns:
-        A JSON array of objects with `name` and `url` for each calendar. When
-        ALLOWED_CALENDARS is configured, only permitted calendars are returned.
+        A JSON array of objects with `name`, `url`, `kind`, and `components` for
+        each collection. When ALLOWED_CALENDARS is configured, only permitted
+        collections are returned.
     """
     result = []
     for cal in _get_principal().calendars():
         name = _calendar_name(cal)
         if ALLOWED_CALENDARS and name not in ALLOWED_CALENDARS:
             continue
-        result.append({"name": name, "url": str(cal.url)})
+        components = _supported_components(cal)
+        entry_kind = _calendar_kind(components)
+        # "calendar" hides only *confirmed* task lists, so a calendar whose
+        # component set the server didn't advertise ("unknown") is never dropped.
+        if kind == "calendar" and entry_kind == "tasks":
+            continue
+        if kind == "tasks" and entry_kind != "tasks":
+            continue
+        result.append(
+            {
+                "name": name,
+                "url": str(cal.url),
+                "kind": entry_kind,
+                "components": components,
+            }
+        )
     return json.dumps(result)
 
 
