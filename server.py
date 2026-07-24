@@ -22,6 +22,7 @@ import caldav
 from icalendar import Calendar as ICalendar
 from icalendar import Event as IEvent
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
 
@@ -268,10 +269,27 @@ def _set_prop(vevent: IEvent, name: str, value) -> None:
     vevent.add(name, value)
 
 
+# Tool annotations. Clients (e.g. Claude's connector settings) use these hints to
+# group tools as read vs write and to decide what warrants confirmation, so every
+# tool declares them. `openWorldHint` is true throughout: each call talks to an
+# external CalDAV server.
+READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=True)
+# Creating adds a new event without altering existing ones, and each call makes
+# another event — not destructive, not idempotent.
+CREATE = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True
+)
+# Updating overwrites existing fields and deleting removes data: destructive, but
+# repeating the same call lands on the same end state.
+DESTRUCTIVE = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=True
+)
+
+
 # --- Read tools ---------------------------------------------------------------
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def list_calendars(kind: str = "calendar") -> str:
     """List the collections available in the connected CalDAV account.
 
@@ -314,7 +332,7 @@ def list_calendars(kind: str = "calendar") -> str:
     return json.dumps(result)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def list_events(start: str, end: str, calendar: str | None = None) -> str:
     """List events in a calendar within a time window.
 
@@ -336,7 +354,7 @@ def list_events(start: str, end: str, calendar: str | None = None) -> str:
     return json.dumps(summaries)
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY)
 def get_event(uid: str, calendar: str | None = None) -> str:
     """Fetch a single event by its UID.
 
@@ -358,7 +376,7 @@ def get_event(uid: str, calendar: str | None = None) -> str:
 # --- Write tools --------------------------------------------------------------
 
 
-@mcp.tool()
+@mcp.tool(annotations=CREATE)
 def create_event(
     summary: str,
     start: str,
@@ -407,7 +425,7 @@ def create_event(
     return f"Event created in {_calendar_name(cal)!r} with UID {uid}."
 
 
-@mcp.tool()
+@mcp.tool(annotations=DESTRUCTIVE)
 def update_event(
     uid: str,
     calendar: str | None = None,
@@ -459,7 +477,7 @@ def update_event(
     return f"Event {uid} updated in {_calendar_name(cal)!r}."
 
 
-@mcp.tool()
+@mcp.tool(annotations=DESTRUCTIVE)
 def delete_event(uid: str, calendar: str | None = None) -> str:
     """Delete an event by its UID.
 
