@@ -272,8 +272,11 @@ def _set_prop(vevent: IEvent, name: str, value) -> None:
 # Tool annotations. Clients (e.g. Claude's connector settings) use these hints to
 # group tools as read vs write and to decide what warrants confirmation, so every
 # tool declares them. `openWorldHint` is true throughout: each call talks to an
-# external CalDAV server.
-READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=True)
+# external CalDAV server. Named READ (not READ_ONLY) on purpose: a module-level
+# `READ_ONLY = ToolAnnotations(...)` would shadow the READ_ONLY env-var boolean
+# above, which _require_writable() reads at call time — permanently disabling the
+# create/update/delete tools regardless of the env var.
+READ = ToolAnnotations(readOnlyHint=True, openWorldHint=True)
 # Creating adds a new event without altering existing ones, and each call makes
 # another event — not destructive, not idempotent.
 CREATE = ToolAnnotations(
@@ -289,7 +292,7 @@ DESTRUCTIVE = ToolAnnotations(
 # --- Read tools ---------------------------------------------------------------
 
 
-@mcp.tool(annotations=READ_ONLY)
+@mcp.tool(annotations=READ)
 def list_calendars(kind: str = "calendar") -> str:
     """List the collections available in the connected CalDAV account.
 
@@ -332,7 +335,7 @@ def list_calendars(kind: str = "calendar") -> str:
     return json.dumps(result)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@mcp.tool(annotations=READ)
 def list_events(start: str, end: str, calendar: str | None = None) -> str:
     """List events in a calendar within a time window.
 
@@ -354,7 +357,7 @@ def list_events(start: str, end: str, calendar: str | None = None) -> str:
     return json.dumps(summaries)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@mcp.tool(annotations=READ)
 def get_event(uid: str, calendar: str | None = None) -> str:
     """Fetch a single event by its UID.
 
