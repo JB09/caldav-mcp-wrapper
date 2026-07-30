@@ -278,11 +278,11 @@ def is_permitted(entry: dict) -> bool:
     return entry.get("id") in ALLOWED_SUBSCRIPTIONS or entry.get("name") in ALLOWED_SUBSCRIPTIONS
 
 
-def resolve(target: str) -> dict | None:
-    """Find a subscription by id, URL, or display name. Returns None if no match.
+def resolve_exact(target: str) -> dict | None:
+    """Find a subscription by id or feed URL — its unambiguous identity.
 
-    id and URL are matched first: names are not unique (and a subscription can
-    share a name with a real calendar), so they are the weakest signal.
+    Safe to check before consulting CalDAV: an id or feed URL can only ever mean
+    a subscription.
     """
     candidate = (target or "").strip()
     if not candidate:
@@ -299,10 +299,29 @@ def resolve(target: str) -> dict | None:
         for entry in entries:
             if entry["url"].rstrip("/") == normalized.rstrip("/"):
                 return entry
-    for entry in entries:
+    return None
+
+
+def resolve_by_name(target: str) -> dict | None:
+    """Find a subscription by display name.
+
+    Names are neither unique nor reserved — a feed can be named the same as a
+    real calendar — so callers must try real calendars first and fall back to
+    this, otherwise adding a feed called "Home" would silently shadow the actual
+    Home calendar.
+    """
+    candidate = (target or "").strip()
+    if not candidate:
+        return None
+    for entry in load():
         if entry.get("name") == candidate:
             return entry
     return None
+
+
+def resolve(target: str) -> dict | None:
+    """Find a subscription by id, URL, or name (in that order of confidence)."""
+    return resolve_exact(target) or resolve_by_name(target)
 
 
 def fetch(url: str, force: bool = False) -> str:

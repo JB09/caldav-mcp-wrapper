@@ -199,15 +199,12 @@ def _resolve_target(name: str | None) -> str:
     return target
 
 
-def _subscription_for(target: str) -> dict | None:
-    """Return the subscription this target names, or None if it isn't one.
+def _permitted_subscription(entry: dict) -> dict:
+    """Return the entry, or raise if ALLOWED_SUBSCRIPTIONS excludes it.
 
-    Raises when the feed exists but ALLOWED_SUBSCRIPTIONS does not permit it, so
-    a denied feed reports why instead of falling through to "calendar not found".
+    Raising (rather than treating it as "no match") makes a denied feed report
+    why, instead of falling through to a confusing "calendar not found".
     """
-    entry = subscriptions.resolve(target)
-    if entry is None:
-        return None
     if not subscriptions.is_permitted(entry):
         raise ValueError(
             f"Subscription {entry.get('name') or entry['id']!r} is not permitted. "
@@ -216,14 +213,36 @@ def _subscription_for(target: str) -> dict | None:
     return entry
 
 
-def _reject_subscription(target: str) -> None:
-    """Guard mutating tools: ICS subscriptions are read-only feeds."""
-    entry = subscriptions.resolve(target)
+def _resolve_any(target: str) -> tuple[str, object]:
+    """Resolve a target to ("subscription", entry) or ("calendar", cal).
+
+    Real calendars win on a name match: a subscription id/feed URL can only mean
+    a subscription, but a *name* can belong to either, and a feed must never
+    shadow the account's own calendar (adding a feed called "Home" would
+    otherwise silently redirect every read away from the real Home calendar).
+    So: exact subscription identity, then real calendars, then feed names.
+    """
+    entry = subscriptions.resolve_exact(target)
     if entry is not None:
+        return "subscription", _permitted_subscription(entry)
+    try:
+        return "calendar", _resolve_calendar(target)
+    except ValueError:
+        entry = subscriptions.resolve_by_name(target)
+        if entry is not None:
+            return "subscription", _permitted_subscription(entry)
+        raise
+
+
+def _resolve_writable(target: str) -> "caldav.Calendar":
+    """Resolve a target for a mutating tool, refusing read-only ICS subscriptions."""
+    kind, resolved = _resolve_any(target)
+    if kind == "subscription":
         raise ValueError(
             f"Calendar {target!r} is a read-only ICS subscription "
-            f"(id {entry['id']}); it cannot be created in, updated, or deleted from."
+            f"(id {resolved['id']}); it cannot be created in, updated, or deleted from."
         )
+    return resolved
 
 
 def _require_writable() -> None:
@@ -430,17 +449,14 @@ def list_events(start: str, end: str, calendar: str | None = None) -> str:
         A JSON array of events (uid, summary, start, end, location, description).
         Recurring events are expanded to one entry per occurrence in the window.
     """
-    target = _resolve_target(calendar)
     start_dt = _parse_dt(start, all_day=False)
     end_dt = _parse_dt(end, all_day=False)
 
-    entry = _subscription_for(target)
-    if entry is not None:
-        occurrences = subscriptions.expand_events(entry, start_dt, end_dt)
+    kind, resolved = _resolve_any(_resolve_target(calendar))
+    if kind == "subscription":
+        occurrences = subscriptions.expand_events(resolved, start_dt, end_dt)
         return json.dumps([_summarize_component(c) for c in occurrences])
-
-    cal = _resolve_calendar(target)
-    return json.dumps(_search_events(cal, start_dt, end_dt))
+    return json.dumps(_search_events(resolved, start_dt, end_dt))
 
 
 @mcp.tool(annotations=READ)
@@ -455,16 +471,13 @@ def get_event(uid: str, calendar: str | None = None) -> str:
     Returns:
         A JSON object describing the event, or a JSON `null` if not found.
     """
-    target = _resolve_target(calendar)
-
-    entry = _subscription_for(target)
-    if entry is not None:
-        component = subscriptions.find_event(entry, uid)
+    kind, resolved = _resolve_any(_resolve_target(calendar))
+    if kind == "subscription":
+        component = subscriptions.find_event(resolved, uid)
         return json.dumps(_summarize_component(component) if component is not None else None)
 
-    cal = _resolve_calendar(target)
     try:
-        event = cal.event_by_uid(uid)
+        event = resolved.event_by_uid(uid)
     except caldav.error.NotFoundError:
         return json.dumps(None)
     return json.dumps(_summarize_event(event))
@@ -499,9 +512,7 @@ def create_event(
         A short confirmation string including the new event's UID.
     """
     _require_writable()
-    target = _resolve_target(calendar)
-    _reject_subscription(target)
-    cal = _resolve_calendar(target)
+    cal = _resolve_writable(_resolve_target(calendar))
 
     uid = f"{uuid.uuid4()}@caldav-mcp"
     vevent = IEvent()
@@ -554,9 +565,7 @@ def update_event(
         A short confirmation string.
     """
     _require_writable()
-    target = _resolve_target(calendar)
-    _reject_subscription(target)
-    cal = _resolve_calendar(target)
+    cal = _resolve_writable(_resolve_target(calendar))
     event = cal.event_by_uid(uid)
 
     ical = event.icalendar_instance
@@ -591,9 +600,7 @@ def delete_event(uid: str, calendar: str | None = None) -> str:
         A short confirmation string.
     """
     _require_writable()
-    target = _resolve_target(calendar)
-    _reject_subscription(target)
-    cal = _resolve_calendar(target)
+    cal = _resolve_writable(_resolve_target(calendar))
     cal.event_by_uid(uid).delete()
     return f"Event {uid} deleted from {_calendar_name(cal)!r}."
 
