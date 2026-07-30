@@ -85,10 +85,32 @@ POMERIUM_ISSUER = os.environ.get("POMERIUM_ISSUER", "")
 # is logged and the server keeps running.
 STARTUP_TEST = os.environ.get("STARTUP_TEST", "false").lower() == "true"
 
+# The container healthcheck polls /healthz every 30s, so its access-log lines
+# drown out everything that actually happened — a tool call, a failed fetch. They
+# are filtered out by default; set this to `true` when debugging the probe itself.
+LOG_HEALTHZ = os.environ.get("LOG_HEALTHZ", "false").lower() == "true"
+
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8080"))
 
 mcp = FastMCP("caldav-mcp", host=HOST, port=PORT)
+
+
+class _HealthzFilter(logging.Filter):
+    """Drop uvicorn access-log lines for the healthcheck endpoint."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "/healthz" not in record.getMessage()
+
+
+def _quiet_healthz_logging() -> None:
+    """Filter healthcheck noise out of the access log.
+
+    Applied after uvicorn has configured its loggers, since uvicorn's dictConfig
+    would otherwise replace the logger this attaches to.
+    """
+    if not LOG_HEALTHZ:
+        logging.getLogger("uvicorn.access").addFilter(_HealthzFilter())
 
 
 def _get_principal() -> "caldav.Principal":
@@ -647,27 +669,30 @@ def add_subscription(name: str, url: str) -> str:
     _require_writable()
     normalized = subscriptions.normalize_url(url)
 
-    # Validate before persisting: fetch + parse, and probe a window so an empty or
-    # non-event feed is visible in the confirmation.
-    subscriptions.parse(subscriptions.fetch(normalized, force=True))
-    probe_start = datetime.now(timezone.utc)
-    probe_end = probe_start + timedelta(days=90)
-    entry = {"url": normalized}
-    try:
-        upcoming = len(subscriptions.expand_events(entry, probe_start, probe_end))
-    except Exception as exc:  # parsed fine, but expansion choked — still worth adding
-        logger.warning("Probe expansion failed for %s: %s", normalized, exc)
-        upcoming = -1
+    # Validate before persisting, and report what the feed actually holds. Size
+    # and VEVENT count are reported alongside the occurrence count because a feed
+    # can be valid iCalendar with no events yet — without the size, that is
+    # indistinguishable from a broken URL.
+    report = subscriptions.probe(normalized, days=90)
 
     action = subscriptions.upsert(name, normalized)
     # The validating fetch above ran before the entry existed, so stamp it now.
-    subscriptions.record_status(normalized, "ok (validated on add)")
-    added = subscriptions.resolve(normalized)
-    count = "unknown (feed parsed, but recurrence expansion failed)" if upcoming < 0 else upcoming
-    return (
-        f"Subscription {action} — {name!r} (id {added['id']}), "
-        f"{count} event(s) in the next 90 days."
+    subscriptions.record_status(
+        normalized, f"ok (validated on add, {report['bytes']} bytes)"
     )
+    added = subscriptions.resolve(normalized)
+
+    summary = (
+        f"Subscription {action} — {name!r} (id {added['id']}): "
+        f"{report['bytes']} bytes, {report['vevents']} VEVENT(s), "
+        f"{report['occurrences']} event(s) in the next 90 days."
+    )
+    if not report["vevents"]:
+        summary += (
+            " The feed is valid iCalendar but publishes no events yet — it will "
+            "start returning them automatically once the publisher adds some."
+        )
+    return summary
 
 
 @mcp.tool(annotations=READ)
@@ -690,7 +715,8 @@ def remove_subscription(id_or_url: str) -> str:
     any iCloud calendar.
 
     Args:
-        id_or_url: The subscription's id (from `list_subscriptions`) or its URL.
+        id_or_url: The subscription's id (from `list_subscriptions`), its URL,
+            or its display name.
 
     Returns:
         A short confirmation, or a note that nothing matched.
@@ -837,6 +863,8 @@ if __name__ == "__main__":
                 "POMERIUM_AUDIENCE, or set REQUIRE_POMERIUM_IDENTITY=false."
             )
             raise SystemExit(1)
+        _quiet_healthz_logging()
         _run_with_identity_gate()
     else:
+        _quiet_healthz_logging()
         mcp.run(transport="streamable-http")
