@@ -26,7 +26,52 @@ Write (disabled when `READ_ONLY=true`):
 | `update_event` | Update fields of an existing event by UID. |
 | `delete_event` | Delete an event by UID. |
 
+Subscribed ICS feeds (see below):
+
+| Tool | Purpose |
+| --- | --- |
+| `list_subscriptions` | List the subscribed feeds and their last fetch result. |
+| `add_subscription` | Subscribe to an ICS feed URL (validated on add). |
+| `remove_subscription` | Stop serving a feed. |
+
 Times are ISO 8601. Use `YYYY-MM-DD` with `all_day: true` for whole-day events.
+
+## Subscribed ICS calendars
+
+Apple **"subscribed calendars"** (team/league schedules, holiday feeds) are stored
+device-side and are **not reachable over CalDAV** — they never appear in
+`list_calendars` and nothing you configure on the CalDAV side will surface them.
+
+The underlying data is just an iCalendar document at an HTTP(S) URL, so this
+server can pull those URLs directly as a second, **read-only** source:
+
+```
+add_subscription(name="Team Schedule", url="webcal://example.com/team.ics")
+```
+
+`webcal://` links (what Apple hands out) are rewritten to `https://`. The feed is
+fetched once at add-time so a bad URL fails immediately rather than silently
+returning nothing later. After that the feed's events are readable through the
+normal `list_events` / `get_event` tools, and `list_calendars` reports it with
+`"kind": "subscription"` and `"read_only": true`.
+
+Details worth knowing:
+
+- **Recurrence is expanded.** Team schedules lean on `RRULE`; occurrences are
+  expanded within the queried window so a weekly practice appears on every date.
+- **Feeds are cached** for `ICS_CACHE_TTL` (default 15 min) and then revalidated
+  with `ETag`/`If-Modified-Since` rather than re-downloaded.
+- **Always read-only.** `create_event`/`update_event`/`delete_event` reject a
+  subscription target with a clear error.
+- **Identity is the feed URL/id**, not the display name — pass the `id` or URL
+  from `list_calendars` when names collide.
+- **Persistence:** the pull list is stored at `SUBSCRIPTIONS_FILE`
+  (default `/data/subscriptions.json`) on the `caldav_mcp_data` volume, so feeds
+  added at runtime survive restarts and image updates. Declare feeds up front with
+  `SUBSCRIBED_ICS` if you prefer config over the tool.
+- **SSRF guard:** `add_subscription` fetches an arbitrary URL, so private,
+  loopback and link-local targets are refused (every redirect hop is re-checked).
+  Set `ICS_ALLOW_PRIVATE_IPS=true` only to subscribe to a LAN-hosted feed.
 
 ## Security architecture — read this first
 
@@ -80,7 +125,12 @@ the image. Key variables:
 | `CALDAV_PASSWORD` | — (required) | App-specific password. |
 | `DEFAULT_CALENDAR` | — | Calendar used when `calendar` is omitted. |
 | `ALLOWED_CALENDARS` | — | Comma-separated allowlist; empty = all. |
-| `READ_ONLY` | `false` | Disable write tools when `true`. |
+| `READ_ONLY` | `false` | Disable write tools (incl. subscription management) when `true`. |
+| `SUBSCRIPTIONS_FILE` | `/data/subscriptions.json` | Persisted ICS pull list; must be on a volume. |
+| `SUBSCRIBED_ICS` | — | Optional JSON `{"name": "url"}` seed merged at startup. |
+| `ALLOWED_SUBSCRIPTIONS` | — | Comma-separated allowlist of feed names/ids; empty = all. |
+| `ICS_CACHE_TTL` | `900` | Seconds a fetched feed is reused before revalidating. |
+| `ICS_ALLOW_PRIVATE_IPS` | `false` | Allow feeds on private/LAN addresses (SSRF guard off). |
 | `STARTUP_TEST` | `false` | Connect and list calendars at startup to verify config. |
 
 ## Run

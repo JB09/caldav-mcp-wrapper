@@ -21,6 +21,14 @@ services:
       READ_ONLY: ${READ_ONLY:-false}
       CALDAV_TIMEOUT: ${CALDAV_TIMEOUT:-20}
       EXPAND_RECURRENCES: ${EXPAND_RECURRENCES:-true}
+      # Subscribed ICS feeds (read-only). The pull list lives on the `data` volume
+      # below so feeds added at runtime survive a container restart.
+      SUBSCRIPTIONS_FILE: ${SUBSCRIPTIONS_FILE:-/data/subscriptions.json}
+      SUBSCRIBED_ICS: ${SUBSCRIBED_ICS:-}
+      ALLOWED_SUBSCRIPTIONS: ${ALLOWED_SUBSCRIPTIONS:-}
+      ICS_TIMEOUT: ${ICS_TIMEOUT:-20}
+      ICS_CACHE_TTL: ${ICS_CACHE_TTL:-900}
+      ICS_ALLOW_PRIVATE_IPS: ${ICS_ALLOW_PRIVATE_IPS:-false}
       STARTUP_TEST: ${STARTUP_TEST:-false}
       REQUIRE_POMERIUM_IDENTITY: ${REQUIRE_POMERIUM_IDENTITY:-false}
       POMERIUM_IDENTITY_HEADER: ${POMERIUM_IDENTITY_HEADER:-x-pomerium-assertion,x-pomerium-jwt-assertion}
@@ -30,6 +38,9 @@ services:
     # No published `ports:` on purpose — do not bind a public interface. The
     # authorization proxy reaches the server by container name over the internal
     # `proxy` network below; the app listens on port 8080.
+    # Persists the ICS subscription pull list across restarts and image updates.
+    volumes:
+      - data:/data
     networks:
       - proxy
     labels:
@@ -45,6 +56,10 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+volumes:
+  data:
+    name: ${DATA_VOLUME:-caldav_mcp_data}
 
 networks:
   proxy:
