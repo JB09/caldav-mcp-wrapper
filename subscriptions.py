@@ -24,7 +24,7 @@ import os
 import re
 import socket
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 import httpx
@@ -211,49 +211,79 @@ def seed_from_env() -> None:
 
 
 def upsert(name: str, url: str) -> str:
-    """Add or refresh an entry keyed by normalized URL. Returns 'added'/'updated'."""
+    """Add or refresh an entry keyed by normalized URL. Returns 'added'/'updated'.
+
+    Logs the change: the pull list is persisted config that three paths can
+    mutate (the MCP tools, the CLI, and SUBSCRIBED_ICS seeding), so without a log
+    line there is no trail explaining why a feed appeared or vanished.
+    """
+    result: dict = {}
 
     def apply(entries: list[dict]):
         for entry in entries:
             if entry["url"] == url:
                 entry["name"] = name or entry.get("name", "")
                 entry["id"] = make_id(entry["name"], url)
+                result.update(entry)
                 return "updated", entries
-        entries.append(
-            {
-                "id": make_id(name, url),
-                "name": name,
-                "url": url,
-                "read_only": True,
-                "added_at": datetime.now(timezone.utc).isoformat(),
-                "last_fetch": None,
-                "last_status": None,
-            }
-        )
+        entry = {
+            "id": make_id(name, url),
+            "name": name,
+            "url": url,
+            "read_only": True,
+            "added_at": datetime.now(timezone.utc).isoformat(),
+            "last_fetch": None,
+            "last_status": None,
+        }
+        entries.append(entry)
+        result.update(entry)
         return "added", entries
 
-    return _mutate(apply)
+    action = _mutate(apply)
+    logger.info("subscription %s: %s %r (%s)", action, result.get("id"), name, url)
+    return action
 
 
-def remove(id_or_url: str) -> dict | None:
-    """Remove an entry by id or URL. Returns the removed entry, or None."""
-    target = (id_or_url or "").strip()
-    try:
-        normalized = normalize_url(target)
-    except ValueError:
-        normalized = None
+def remove(target_str: str) -> dict | None:
+    """Remove an entry by id, URL, or display name. Returns it, or None.
+
+    Resolution matches everywhere else (id, then URL, then name) — removing is
+    the one place where accepting only an id would be actively annoying, since
+    the name is what the caller knows. Names are unambiguous here because this
+    only ever searches subscriptions, never real calendars.
+    """
+    target = (target_str or "").strip()
+    entry = resolve(target)
 
     def apply(entries: list[dict]):
-        for i, entry in enumerate(entries):
-            if entry.get("id") == target or entry["url"] in (target, normalized):
+        if entry is None:
+            return None, entries
+        for i, candidate in enumerate(entries):
+            if candidate.get("id") == entry["id"]:
                 return entries.pop(i), entries
         return None, entries
 
-    return _mutate(apply)
+    removed = _mutate(apply)
+    if removed is None:
+        logger.info("subscription remove: no match for %r", target)
+    else:
+        logger.info(
+            "subscription removed: %s %r (%s)",
+            removed.get("id"),
+            removed.get("name", ""),
+            removed["url"],
+        )
+    return removed
 
 
-def _record_status(url: str, status: str) -> None:
-    """Best-effort stamp of last_fetch/last_status on an entry."""
+def record_status(url: str, status: str) -> None:
+    """Best-effort stamp of last_fetch/last_status on an entry.
+
+    A no-op when no entry has this URL yet, which is the case during the
+    validating fetch of a brand-new feed — so callers that add a feed stamp it
+    again after the upsert, otherwise a freshly added feed would report as never
+    fetched until something happened to read it.
+    """
 
     def apply(entries: list[dict]):
         for entry in entries:
@@ -368,17 +398,17 @@ def fetch(url: str, force: bool = False) -> str:
     except ValueError:
         raise
     except Exception as exc:
-        _record_status(url, f"error: {type(exc).__name__}: {exc}")
+        record_status(url, f"error: {type(exc).__name__}: {exc}")
         raise RuntimeError(f"Could not fetch feed {url}: {type(exc).__name__}: {exc}") from exc
 
     if response.status_code == 304 and cached:
         with _cache_lock:
             _cache[url]["fetched_at"] = now
-        _record_status(url, "ok (304 not modified)")
+        record_status(url, "ok (304 not modified)")
         return cached["text"]
 
     if response.status_code >= 400:
-        _record_status(url, f"error: HTTP {response.status_code}")
+        record_status(url, f"error: HTTP {response.status_code}")
         raise RuntimeError(f"Feed {url} returned HTTP {response.status_code}.")
 
     text = response.text
@@ -389,7 +419,7 @@ def fetch(url: str, force: bool = False) -> str:
             "last_modified": response.headers.get("last-modified"),
             "fetched_at": now,
         }
-    _record_status(url, f"ok (HTTP {response.status_code}, {len(text)} bytes)")
+    record_status(url, f"ok (HTTP {response.status_code}, {len(text)} bytes)")
     return text
 
 
@@ -414,6 +444,31 @@ def expand_events(entry: dict, start_dt, end_dt) -> list:
     """
     cal = parse(fetch(entry["url"]))
     return recurring_ical_events.of(cal).between(start_dt, end_dt)
+
+
+def probe(url: str, days: int = 90) -> dict:
+    """Fetch a feed and report what it actually contains.
+
+    Returns {bytes, vevents, occurrences, events}: the raw size and VEVENT count
+    straight from the document, plus expanded occurrences in the next `days`.
+    Reporting size and VEVENT count separately matters — a feed can be perfectly
+    valid iCalendar and still hold no events (a published calendar whose schedule
+    is not out yet looks exactly like a broken URL if you only count events).
+    """
+    text = fetch(url, force=True)
+    cal = parse(text)
+    start = datetime.now(timezone.utc)
+    try:
+        occurrences = recurring_ical_events.of(cal).between(start, start + timedelta(days=days))
+    except Exception as exc:
+        logger.warning("Recurrence expansion failed for %s: %s", url, exc)
+        occurrences = []
+    return {
+        "bytes": len(text),
+        "vevents": text.count("BEGIN:VEVENT"),
+        "occurrences": len(occurrences),
+        "events": occurrences,
+    }
 
 
 def find_event(entry: dict, uid: str):
@@ -463,8 +518,13 @@ def _cli(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Skip the validating fetch (use when the feed is temporarily unreachable).",
     )
-    p_remove = sub.add_parser("remove", help="Remove a feed by id or URL.")
-    p_remove.add_argument("id_or_url")
+    p_remove = sub.add_parser("remove", help="Remove a feed by id, URL, or name.")
+    p_remove.add_argument("target")
+    p_inspect = sub.add_parser(
+        "inspect", help="Show what a feed actually contains (size, events)."
+    )
+    p_inspect.add_argument("id_or_url")
+    p_inspect.add_argument("--days", type=int, default=90)
     args = parser.parse_args(argv)
 
     if args.command == "list":
@@ -472,21 +532,53 @@ def _cli(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "add":
+        report = None
         try:
             normalized = normalize_url(args.url)
             if not args.no_validate:
-                parse(fetch(normalized, force=True))
+                report = probe(normalized)
         except Exception as exc:
             print(f"error: {exc}")
             return 1
         action = upsert(args.name, normalized)
+        if report is not None:
+            # The validating fetch ran before the entry existed; stamp it now.
+            record_status(normalized, f"ok (validated on add, {report['bytes']} bytes)")
         entry = resolve_exact(normalized)
         print(f"{action}: {entry['id']}  {args.name}  {normalized}")
+        if report is not None:
+            print(
+                f"  {report['bytes']} bytes, {report['vevents']} VEVENT(s), "
+                f"{report['occurrences']} event(s) in the next 90 days"
+            )
+            if not report["vevents"]:
+                print("  note: valid iCalendar, but the feed publishes no events yet.")
         return 0
 
-    removed = remove(args.id_or_url)
+    if args.command == "inspect":
+        entry = resolve(args.id_or_url)
+        url = entry["url"] if entry else args.id_or_url
+        try:
+            report = probe(url, days=args.days)
+        except Exception as exc:
+            print(f"error: {exc}")
+            return 1
+        label = f"{entry['id']}  {entry.get('name', '')}" if entry else url
+        print(label)
+        print(f"  bytes:       {report['bytes']}")
+        print(f"  VEVENTs:     {report['vevents']}")
+        print(f"  occurrences: {report['occurrences']} in the next {args.days} day(s)")
+        if not report["vevents"]:
+            print("  note: the feed is valid iCalendar but publishes no events yet.")
+        for component in report["events"][:10]:
+            start = component.get("dtstart")
+            when = getattr(start, "dt", start)
+            print(f"    {when}  {component.get('summary', '')}")
+        return 0
+
+    removed = remove(args.target)
     if removed is None:
-        print(f"no subscription matched {args.id_or_url!r}")
+        print(f"no subscription matched {args.target!r}")
         return 1
     print(f"removed: {removed['id']}  {removed.get('name', '')}")
     return 0

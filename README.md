@@ -32,7 +32,7 @@ Subscribed ICS feeds (see below):
 | --- | --- |
 | `list_subscriptions` | List the subscribed feeds and their last fetch result. |
 | `add_subscription` | Subscribe to an ICS feed URL (validated on add). |
-| `remove_subscription` | Stop serving a feed. |
+| `remove_subscription` | Stop serving a feed (by id, URL, or name). |
 
 Times are ISO 8601. Use `YYYY-MM-DD` with `all_day: true` for whole-day events.
 
@@ -85,12 +85,19 @@ server is running and changes take effect immediately (no restart):
 ```bash
 docker compose exec -T caldav-mcp python subscriptions.py list
 docker compose exec -T caldav-mcp python subscriptions.py add "Team Schedule" "webcal://example.com/team.ics"
-docker compose exec -T caldav-mcp python subscriptions.py remove <id-or-url>
+docker compose exec -T caldav-mcp python subscriptions.py inspect "Team Schedule"
+docker compose exec -T caldav-mcp python subscriptions.py remove "Team Schedule"
 ```
 
-`add` validates by fetching the feed, the same as the tool; pass `--no-validate`
-to add a feed that is temporarily unreachable. `remove` accepts an id or a URL and
-exits non-zero if nothing matched.
+`add` validates by fetching the feed, the same as the tool, and reports its size
+and event count; pass `--no-validate` to add a feed that is temporarily
+unreachable. `inspect` re-fetches and shows what a feed actually contains — size,
+`VEVENT` count, and the next occurrences — which is how you tell a broken URL from
+a valid feed whose schedule simply isn't published yet. `remove` exits non-zero if
+nothing matched. All three accept an id, a URL, or a display name.
+
+Adding and removing feeds is logged at INFO, so `docker compose logs caldav-mcp`
+shows why a feed appeared or vanished no matter which path changed it.
 
 To declare feeds up front instead, set `SUBSCRIBED_ICS` to a JSON `{"name": "url"}`
 map — it is merged into the pull list at startup (additive: it never removes
@@ -154,6 +161,7 @@ the image. Key variables:
 | `ALLOWED_SUBSCRIPTIONS` | — | Comma-separated allowlist of feed names/ids; empty = all. |
 | `ICS_CACHE_TTL` | `900` | Seconds a fetched feed is reused before revalidating. |
 | `ICS_ALLOW_PRIVATE_IPS` | `false` | Allow feeds on private/LAN addresses (SSRF guard off). |
+| `LOG_HEALTHZ` | `false` | Log `/healthz` access lines (noisy; off by default). |
 | `STARTUP_TEST` | `false` | Connect and list calendars at startup to verify config. |
 
 ## Run
