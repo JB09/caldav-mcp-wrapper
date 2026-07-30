@@ -114,4 +114,59 @@ post_mcp "evil.example.com" -d "$INIT"
 [ "$STATUS" = "421" ] || fail "foreign host got HTTP $STATUS (expected 421) — guard not enforcing"
 echo "  OK: guard accepts the route host and rejects others"
 
+# --- Phase 3: ICS feed fetching -------------------------------------------
+# subscriptions.py fetches feeds with httpx2, which verifies TLS against the
+# *system* trust store rather than a bundled certifi CA set. That makes feed
+# fetching depend on the base image shipping ca-certificates — a dependency a
+# base-image bump could silently drop. Assert the store loads, then exercise the
+# real fetch path end to end. Runs inside the container against a server bound to
+# its own loopback, so it needs no network egress and cannot flake.
+echo "==> phase 3: ICS fetch (httpx2 + system trust store)"
+docker exec -e ICS_ALLOW_PRIVATE_IPS=true -e SUBSCRIPTIONS_FILE=/tmp/smoke-subs.json \
+  "$NAME" python - <<'PY' || fail "ICS fetch check failed (see output above)"
+import ssl, threading, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import truststore  # noqa: F401  -- httpx2's default verifier must be importable
+
+# truststore resolves the OS store lazily and cannot enumerate it, so check the
+# OpenSSL default paths it delegates to on Linux: empty here means the image has
+# no ca-certificates and every HTTPS feed fetch would fail to verify.
+n = len(ssl.create_default_context().get_ca_certs())
+if n == 0:
+    sys.exit(f"system trust store is empty ({ssl.get_default_verify_paths()}) — base "
+             "image is missing ca-certificates, so HTTPS feed fetching would fail")
+print(f"  - system trust store OK ({n} CAs)")
+
+ICS = (b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//smoke//EN\r\nBEGIN:VEVENT\r\n"
+       b"UID:smoke-1\r\nDTSTART:20260801T100000Z\r\nDTEND:20260801T110000Z\r\n"
+       b"SUMMARY:Smoke\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n")
+
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        # Exercise the redirect branch too: it relies on URL.join(), which is the
+        # part of the client API most likely to drift between implementations.
+        if self.path == "/redirect":
+            self.send_response(302); self.send_header("Location", "/feed.ics"); self.end_headers(); return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/calendar")
+        self.send_header("ETag", '"smoke"')
+        self.send_header("Content-Length", str(len(ICS)))
+        self.end_headers(); self.wfile.write(ICS)
+
+srv = HTTPServer(("127.0.0.1", 8099), H)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+import subscriptions
+for label, url in (("direct", "http://127.0.0.1:8099/feed.ics"),
+                   ("redirect", "http://127.0.0.1:8099/redirect")):
+    text = subscriptions.fetch(url, force=True)
+    event = subscriptions.parse(text).walk("VEVENT")[0]
+    if str(event["SUMMARY"]) != "Smoke":
+        sys.exit(f"{label}: unexpected event {event['SUMMARY']!r}")
+    print(f"  - {label} fetch + parse OK")
+PY
+echo "  OK: feeds fetch and parse"
+
 echo "==> smoke test passed"
