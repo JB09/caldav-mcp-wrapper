@@ -27,7 +27,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
-import httpx
+import httpx2
 import recurring_ical_events
 from filelock import FileLock
 from icalendar import Calendar as ICalendar
@@ -377,11 +377,11 @@ def fetch(url: str, force: bool = False) -> str:
 
     current = url
     try:
-        with httpx.Client(timeout=ICS_TIMEOUT, follow_redirects=False) as client:
+        with httpx2.Client(timeout=ICS_TIMEOUT, follow_redirects=False) as client:
             for _ in range(_MAX_REDIRECTS):
                 _assert_public_host(current)
                 response = client.get(current, headers=headers)
-                # Match redirect codes explicitly rather than httpx's is_redirect:
+                # Match redirect codes explicitly rather than the client's is_redirect:
                 # 304 Not Modified is also a 3xx, and treating it as a redirect
                 # would break the conditional-GET revalidation below.
                 if response.status_code in (301, 302, 303, 307, 308):

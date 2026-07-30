@@ -23,7 +23,8 @@ from icalendar import Calendar as ICalendar
 from icalendar import Event as IEvent
 
 import subscriptions
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
@@ -93,7 +94,22 @@ LOG_HEALTHZ = os.environ.get("LOG_HEALTHZ", "false").lower() == "true"
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8080"))
 
-mcp = FastMCP("caldav-mcp", host=HOST, port=PORT)
+# Host/Origin allowlist for the SDK's DNS-rebinding guard (MCP SDK >= 2). The
+# guard compares the request's `Host` header against this list and answers 421
+# when it does not match. Behind Pomerium the header is the *public route host*
+# (e.g. caldav-mcp.example.com), not the container's bind address, so the guard
+# has to be told about it — see _transport_security() for what happens when this
+# is left empty. Entries are `host:port` patterns; `example.com:*` allows any port.
+MCP_ALLOWED_HOSTS = [
+    h.strip() for h in os.environ.get("MCP_ALLOWED_HOSTS", "").split(",") if h.strip()
+]
+# Matching allowlist for the `Origin` header, for browser-based clients. Defaults
+# to https:// + each allowed host when left empty but MCP_ALLOWED_HOSTS is set.
+MCP_ALLOWED_ORIGINS = [
+    o.strip() for o in os.environ.get("MCP_ALLOWED_ORIGINS", "").split(",") if o.strip()
+]
+
+mcp = MCPServer("caldav-mcp")
 
 
 class _HealthzFilter(logging.Filter):
@@ -802,6 +818,37 @@ def _verify_assertion(token: str) -> None:
     )
 
 
+def _transport_security() -> TransportSecuritySettings:
+    """Build the SDK's Host/Origin allowlist for this deployment.
+
+    MCP SDK 2.x turns DNS-rebinding protection on by default and, when handed a
+    loopback bind address, allows only localhost. This server binds 0.0.0.0 and is
+    reached through Pomerium, so requests arrive carrying the public route host —
+    which that default rejects with 421 while `/healthz` keeps returning 200, i.e.
+    the container looks healthy while every tool call fails.
+
+    Set MCP_ALLOWED_HOSTS to the route host to keep the guard on (recommended).
+    Left empty, the guard is switched off and the fronting proxy is relied on as
+    the only Host-header check — the pre-2.x behaviour, kept as the default so an
+    SDK upgrade alone cannot take a working deployment offline.
+    """
+    if not MCP_ALLOWED_HOSTS:
+        logger.warning(
+            "MCP_ALLOWED_HOSTS is not set — the DNS-rebinding guard is disabled and "
+            "any Host header is accepted. Set it to the Pomerium route host "
+            "(e.g. caldav-mcp.example.com) to enable it."
+        )
+        return TransportSecuritySettings(enable_dns_rebinding_protection=False)
+
+    origins = MCP_ALLOWED_ORIGINS or [f"https://{h}" for h in MCP_ALLOWED_HOSTS]
+    logger.info("DNS-rebinding guard enabled — allowed hosts: %s", ", ".join(MCP_ALLOWED_HOSTS))
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=MCP_ALLOWED_HOSTS,
+        allowed_origins=origins,
+    )
+
+
 def _run_with_identity_gate() -> None:
     """Serve the MCP app, cryptographically verifying Pomerium's identity on /mcp.
 
@@ -813,7 +860,7 @@ def _run_with_identity_gate() -> None:
     from starlette.concurrency import run_in_threadpool
     from starlette.middleware.base import BaseHTTPMiddleware
 
-    app = mcp.streamable_http_app()
+    app = mcp.streamable_http_app(host=HOST, transport_security=_transport_security())
 
     async def require_identity(request: Request, call_next):
         if request.url.path.startswith("/mcp"):
@@ -867,4 +914,11 @@ if __name__ == "__main__":
         _run_with_identity_gate()
     else:
         _quiet_healthz_logging()
-        mcp.run(transport="streamable-http")
+        # host/port moved off the constructor in SDK 2.x; omitting them here would
+        # silently bind 127.0.0.1:8000 and leave the container unreachable.
+        mcp.run(
+            transport="streamable-http",
+            host=HOST,
+            port=PORT,
+            transport_security=_transport_security(),
+        )

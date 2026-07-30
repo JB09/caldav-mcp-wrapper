@@ -46,13 +46,33 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha
 
+      # Build into the local daemon first so the image can actually be run before
+      # anything is published. Layers are written to the Actions cache and reused
+      # by the push step below, so this is one real build, not two.
+      - name: Build image for smoke test
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: caldav-mcp:smoke
+          # Refresh everything on the weekly scheduled rebuild.
+          no-cache: ${{ github.event_name == 'schedule' }}
+          cache-to: type=gha,mode=max
+          cache-from: type=gha
+
+      # `docker build` succeeding proves only that the image assembles. This runs
+      # a real MCP handshake against the container over a proxied Host header,
+      # which is what catches a server that binds the wrong interface or rejects
+      # Pomerium's Host header with 421 — both of which build and report healthy.
+      - name: Smoke test
+        run: ./scripts/smoke_test.sh caldav-mcp:smoke
+
       - name: Build and push
         uses: docker/build-push-action@v7
         with:
           context: .
           # Push everywhere except PRs, where we only validate that the image builds.
           push: ${{ github.event_name != 'pull_request' }}
-          # Refresh everything on the weekly scheduled rebuild.
-          no-cache: ${{ github.event_name == 'schedule' }}
+          cache-from: type=gha
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
