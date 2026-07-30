@@ -660,6 +660,8 @@ def add_subscription(name: str, url: str) -> str:
         upcoming = -1
 
     action = subscriptions.upsert(name, normalized)
+    # The validating fetch above ran before the entry existed, so stamp it now.
+    subscriptions.record_status(normalized, "ok (validated on add)")
     added = subscriptions.resolve(normalized)
     count = "unknown (feed parsed, but recurrence expansion failed)" if upcoming < 0 else upcoming
     return (

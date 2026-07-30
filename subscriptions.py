@@ -252,8 +252,14 @@ def remove(id_or_url: str) -> dict | None:
     return _mutate(apply)
 
 
-def _record_status(url: str, status: str) -> None:
-    """Best-effort stamp of last_fetch/last_status on an entry."""
+def record_status(url: str, status: str) -> None:
+    """Best-effort stamp of last_fetch/last_status on an entry.
+
+    A no-op when no entry has this URL yet, which is the case during the
+    validating fetch of a brand-new feed — so callers that add a feed stamp it
+    again after the upsert, otherwise a freshly added feed would report as never
+    fetched until something happened to read it.
+    """
 
     def apply(entries: list[dict]):
         for entry in entries:
@@ -368,17 +374,17 @@ def fetch(url: str, force: bool = False) -> str:
     except ValueError:
         raise
     except Exception as exc:
-        _record_status(url, f"error: {type(exc).__name__}: {exc}")
+        record_status(url, f"error: {type(exc).__name__}: {exc}")
         raise RuntimeError(f"Could not fetch feed {url}: {type(exc).__name__}: {exc}") from exc
 
     if response.status_code == 304 and cached:
         with _cache_lock:
             _cache[url]["fetched_at"] = now
-        _record_status(url, "ok (304 not modified)")
+        record_status(url, "ok (304 not modified)")
         return cached["text"]
 
     if response.status_code >= 400:
-        _record_status(url, f"error: HTTP {response.status_code}")
+        record_status(url, f"error: HTTP {response.status_code}")
         raise RuntimeError(f"Feed {url} returned HTTP {response.status_code}.")
 
     text = response.text
@@ -389,7 +395,7 @@ def fetch(url: str, force: bool = False) -> str:
             "last_modified": response.headers.get("last-modified"),
             "fetched_at": now,
         }
-    _record_status(url, f"ok (HTTP {response.status_code}, {len(text)} bytes)")
+    record_status(url, f"ok (HTTP {response.status_code}, {len(text)} bytes)")
     return text
 
 
@@ -480,6 +486,9 @@ def _cli(argv: list[str] | None = None) -> int:
             print(f"error: {exc}")
             return 1
         action = upsert(args.name, normalized)
+        if not args.no_validate:
+            # The validating fetch ran before the entry existed; stamp it now.
+            record_status(normalized, "ok (validated on add)")
         entry = resolve_exact(normalized)
         print(f"{action}: {entry['id']}  {args.name}  {normalized}")
         return 0
