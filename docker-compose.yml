@@ -36,6 +36,11 @@ services:
       POMERIUM_JWKS_URL: ${POMERIUM_JWKS_URL:-}
       POMERIUM_AUDIENCE: ${POMERIUM_AUDIENCE:-}
       POMERIUM_ISSUER: ${POMERIUM_ISSUER:-}
+      # Host/Origin allowlist for the SDK's DNS-rebinding guard. Set
+      # MCP_ALLOWED_HOSTS to the Pomerium route host to turn the guard on; empty
+      # leaves it off (any Host accepted) with a warning logged at startup.
+      MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS:-}
+      MCP_ALLOWED_ORIGINS: ${MCP_ALLOWED_ORIGINS:-}
     # No published `ports:` on purpose — do not bind a public interface. The
     # authorization proxy reaches the server by container name over the internal
     # `proxy` network below; the app listens on port 8080.
