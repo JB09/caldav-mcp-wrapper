@@ -227,11 +227,24 @@ def _resolve_any(target: str) -> tuple[str, object]:
         return "subscription", _permitted_subscription(entry)
     try:
         return "calendar", _resolve_calendar(target)
-    except ValueError:
+    except Exception as exc:
+        # Fall back to a feed of this name. This catches more than "no such
+        # calendar": if CalDAV is unreachable or misconfigured, subscriptions do
+        # not depend on it and stay readable, which is much of their value when
+        # iCloud is having a bad day. The name may in principle belong to a real
+        # calendar we could not reach, so say so rather than failing silently.
         entry = subscriptions.resolve_by_name(target)
-        if entry is not None:
-            return "subscription", _permitted_subscription(entry)
-        raise
+        if entry is None:
+            raise
+        if not isinstance(exc, ValueError):
+            logger.warning(
+                "CalDAV lookup for %r failed (%s: %s); serving the subscription of "
+                "that name instead.",
+                target,
+                type(exc).__name__,
+                exc,
+            )
+        return "subscription", _permitted_subscription(entry)
 
 
 def _resolve_writable(target: str) -> "caldav.Calendar":

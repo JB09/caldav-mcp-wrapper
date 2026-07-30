@@ -72,6 +72,29 @@ Details worth knowing:
 - **SSRF guard:** `add_subscription` fetches an arbitrary URL, so private,
   loopback and link-local targets are refused (every redirect hop is re-checked).
   Set `ICS_ALLOW_PRIVATE_IPS=true` only to subscribe to a LAN-hosted feed.
+- **Feeds do not depend on CalDAV.** If iCloud is unreachable, subscribed feeds
+  stay readable.
+
+### Managing feeds without the MCP tools
+
+The MCP tools are the normal path, but they only work when the server *and* the
+proxy in front of it are healthy. The same pull list can be managed from the
+command line as a backup — it uses the same file and lock, so it works while the
+server is running and changes take effect immediately (no restart):
+
+```bash
+docker compose exec -T caldav-mcp python subscriptions.py list
+docker compose exec -T caldav-mcp python subscriptions.py add "Team Schedule" "webcal://example.com/team.ics"
+docker compose exec -T caldav-mcp python subscriptions.py remove <id-or-url>
+```
+
+`add` validates by fetching the feed, the same as the tool; pass `--no-validate`
+to add a feed that is temporarily unreachable. `remove` accepts an id or a URL and
+exits non-zero if nothing matched.
+
+To declare feeds up front instead, set `SUBSCRIBED_ICS` to a JSON `{"name": "url"}`
+map — it is merged into the pull list at startup (additive: it never removes
+feeds added another way, and it never fetches, so a dead feed cannot block boot).
 
 ## Security architecture — read this first
 
