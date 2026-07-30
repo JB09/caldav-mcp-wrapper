@@ -163,6 +163,8 @@ the image. Key variables:
 | `ICS_ALLOW_PRIVATE_IPS` | `false` | Allow feeds on private/LAN addresses (SSRF guard off). |
 | `LOG_HEALTHZ` | `false` | Log `/healthz` access lines (noisy; off by default). |
 | `STARTUP_TEST` | `false` | Connect and list calendars at startup to verify config. |
+| `MCP_ALLOWED_HOSTS` | — | Allowed `Host` headers (DNS-rebinding guard). Empty = guard off, any host accepted. Set to your Pomerium route host to enable. |
+| `MCP_ALLOWED_ORIGINS` | — | Allowed `Origin` headers. Defaults to `https://` + each allowed host. |
 
 ## Run
 
@@ -181,6 +183,13 @@ The image is built and published to GHCR by CI
 - **CI (`build` workflow)** builds the image on every push/PR, pushes to GHCR on
   `main`, and does a weekly no-cache rebuild so OS/Python security patches land
   even without code changes.
+- **Smoke test** (`scripts/smoke_test.sh`, run by CI before the push step) starts
+  the built image and drives a real MCP `initialize` + `tools/list` against it
+  using a non-localhost `Host` header, then checks that `MCP_ALLOWED_HOSTS`
+  accepts the route host and rejects others. A build alone cannot catch a server
+  that binds the wrong interface or answers `421` to proxied requests — both keep
+  `/healthz` green. Run it locally with `docker build -t caldav-mcp:smoke . &&
+  ./scripts/smoke_test.sh caldav-mcp:smoke`.
 - **Auto-merge** (`dependabot-automerge` workflow) enables auto-merge for
   patch/minor Dependabot bumps once required checks pass; major bumps are left for
   manual review.
