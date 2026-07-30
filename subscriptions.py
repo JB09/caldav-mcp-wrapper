@@ -427,3 +427,71 @@ def find_event(entry: dict, uid: str):
         if str(component.get("uid", "")) == uid:
             return component
     return None
+
+
+# --- CLI -----------------------------------------------------------------------
+
+
+def _cli(argv: list[str] | None = None) -> int:
+    """Manage the pull list from the command line, as a backup to the MCP tools.
+
+    The MCP tools are the normal path, but they are only reachable when the
+    server and the proxy in front of it are healthy. This runs against the same
+    persisted file under the same lock, so it works while the server is running
+    and while the connector is down:
+
+        docker compose exec -T caldav-mcp python subscriptions.py list
+        docker compose exec -T caldav-mcp python subscriptions.py add "Name" "webcal://..."
+        docker compose exec -T caldav-mcp python subscriptions.py remove <id-or-url>
+
+    Changes take effect immediately: the pull list is read per call, so no
+    restart is needed.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="subscriptions",
+        description="Manage the ICS subscription pull list (backup for the MCP tools).",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("list", help="Show the pull list as JSON.")
+    p_add = sub.add_parser("add", help="Subscribe to an ICS feed.")
+    p_add.add_argument("name")
+    p_add.add_argument("url")
+    p_add.add_argument(
+        "--no-validate",
+        action="store_true",
+        help="Skip the validating fetch (use when the feed is temporarily unreachable).",
+    )
+    p_remove = sub.add_parser("remove", help="Remove a feed by id or URL.")
+    p_remove.add_argument("id_or_url")
+    args = parser.parse_args(argv)
+
+    if args.command == "list":
+        print(json.dumps(load(), indent=2))
+        return 0
+
+    if args.command == "add":
+        try:
+            normalized = normalize_url(args.url)
+            if not args.no_validate:
+                parse(fetch(normalized, force=True))
+        except Exception as exc:
+            print(f"error: {exc}")
+            return 1
+        action = upsert(args.name, normalized)
+        entry = resolve_exact(normalized)
+        print(f"{action}: {entry['id']}  {args.name}  {normalized}")
+        return 0
+
+    removed = remove(args.id_or_url)
+    if removed is None:
+        print(f"no subscription matched {args.id_or_url!r}")
+        return 1
+    print(f"removed: {removed['id']}  {removed.get('name', '')}")
+    return 0
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    raise SystemExit(_cli())
