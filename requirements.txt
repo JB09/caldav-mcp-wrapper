@@ -16,7 +16,7 @@ pyjwt[crypto]>=2.13.0
 # SDK is free to change what it depends on. Note httpx2 verifies TLS against the
 # *system* trust store (via truststore) rather than a bundled certifi CA set, so
 # the base image must provide ca-certificates — the smoke test asserts it does.
-httpx2>=2.5.0
+httpx2>=2.9.1
 # Expanding RRULEs in those feeds so recurring events land on every occurrence.
 recurring-ical-events>=3.8.2
 # Locking the persisted subscription pull list against concurrent tool calls.
