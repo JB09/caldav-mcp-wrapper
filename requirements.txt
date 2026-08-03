@@ -20,4 +20,4 @@ httpx2>=2.5.0
 # Expanding RRULEs in those feeds so recurring events land on every occurrence.
 recurring-ical-events>=3.8.2
 # Locking the persisted subscription pull list against concurrent tool calls.
-filelock>=3.13.0
+filelock>=3.32.2
