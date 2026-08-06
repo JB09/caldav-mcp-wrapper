@@ -11,9 +11,15 @@
 #     wrong and every proxied request gets 421 while /healthz still returns 200,
 #     so the container reports healthy with every tool call failing.
 #
-# So this asserts what a real client does: an MCP `initialize` + `tools/list`
-# over the published port, carrying a *non-localhost* Host header the way
-# Pomerium would. No CalDAV account is needed — neither call touches the backend.
+#   * The SDK routes per request on the MCP-Protocol-Version header, so legacy
+#     (handshake + session) and modern 2026-07-28 (single stateless POST)
+#     clients are served by different code. Exercising one proves nothing about
+#     the other.
+#
+# So this asserts what a real client does — in both protocol eras: an MCP
+# `initialize` + `tools/list` over the published port, carrying a *non-localhost*
+# Host header the way Pomerium would, and a sessionless 2026-07-28 `tools/list`.
+# No CalDAV account is needed — none of those calls touch the backend.
 set -euo pipefail
 
 IMAGE="${1:-caldav-mcp:smoke}"
@@ -168,5 +174,67 @@ for label, url in (("direct", "http://127.0.0.1:8099/feed.ics"),
     print(f"  - {label} fetch + parse OK")
 PY
 echo "  OK: feeds fetch and parse"
+
+# --- Phase 4: the modern (MCP 2026-07-28) stateless request path ------------
+# Everything above drives the *legacy* route: an `initialize` handshake at
+# protocolVersion 2025-06-18 followed by requests carrying its Mcp-Session-Id.
+# The SDK picks the era per request from the MCP-Protocol-Version header, so a
+# 2026-07-28 client takes an entirely different code path — one self-contained
+# POST, no handshake, no session — that none of the phases above touch. Without
+# this, an SDK bump could break every modern client while CI stays green, which
+# is the exact class of silent breakage this script exists to catch.
+#
+# Reuses the phase-2/3 container, so this also proves the modern path works with
+# the Host guard on — the posture operators are told to run.
+echo "==> phase 4: modern stateless path (MCP-Protocol-Version: 2026-07-28)"
+
+MODERN_VERSION="2026-07-28"
+# With no handshake, everything the server used to learn from `initialize` rides
+# along on each request instead, in a `params._meta` envelope. All three keys are
+# required — omit them and the server answers 400 (-32602), which is precisely
+# the kind of protocol drift this phase is here to notice.
+META='"_meta":{'
+META+='"io.modelcontextprotocol/protocolVersion":"'$MODERN_VERSION'",'
+META+='"io.modelcontextprotocol/clientCapabilities":{},'
+META+='"io.modelcontextprotocol/clientInfo":{"name":"smoke","version":"1"}}'
+
+echo "  - tools/list with no session"
+post_mcp "$ROUTE_HOST" \
+  -H "MCP-Protocol-Version: $MODERN_VERSION" \
+  -H "Mcp-Method: tools/list" \
+  -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{$META}}"
+[ "$STATUS" = "200" ] || fail "modern tools/list returned HTTP $STATUS (expected 200): $BODY"
+
+for tool in list_calendars list_events get_event create_event update_event \
+            delete_event add_subscription list_subscriptions remove_subscription; do
+  grep -q "\"$tool\"" <<<"$BODY" || fail "modern tools/list is missing '$tool': $BODY"
+done
+
+# The whole point of the modern path is that there is no protocol session to
+# store; a session id coming back would mean the request fell through to the
+# legacy handler and the era routing is broken.
+if grep -qi '^mcp-session-id:' /tmp/smoke_headers; then
+  fail "modern request returned an mcp-session-id header — it was served by the legacy path"
+fi
+
+# server.py declares a cache hint for tools/list; assert it survives to the wire,
+# since a client that never sees it silently re-fetches the catalog every time.
+grep -q '"ttlMs"' <<<"$BODY" || fail "modern tools/list result is missing ttlMs: $BODY"
+grep -q '"cacheScope":"public"' <<<"$BODY" || fail "modern tools/list result is missing cacheScope: $BODY"
+echo "  OK: 9 tools, no session, cache hint present"
+
+# The 2026-07-28 spec requires Mcp-Method (and Mcp-Name) to mirror the body so
+# gateways can route on headers alone; the SDK rejects a mismatch with
+# HEADER_MISMATCH (-32020). That guarantee is what makes per-tool proxy policy
+# safe to write, so prove it holds — and that a proxy rewriting those headers
+# would fail loudly rather than silently bypassing such a policy.
+echo "  - Mcp-Method disagreeing with the body is rejected"
+post_mcp "$ROUTE_HOST" \
+  -H "MCP-Protocol-Version: $MODERN_VERSION" \
+  -H "Mcp-Method: tools/list" \
+  -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"list_calendars\",\"arguments\":{},$META}}"
+[ "$STATUS" = "400" ] || fail "header/body mismatch got HTTP $STATUS (expected 400): $BODY"
+grep -q '\-32020' <<<"$BODY" || fail "expected HEADER_MISMATCH (-32020) in: $BODY"
+echo "  OK: header/body agreement enforced"
 
 echo "==> smoke test passed"
