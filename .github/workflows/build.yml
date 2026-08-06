@@ -57,7 +57,14 @@ jobs:
           tags: caldav-mcp:smoke
           # Refresh everything on the weekly scheduled rebuild.
           no-cache: ${{ github.event_name == 'schedule' }}
-          cache-to: type=gha,mode=max
+          # `ignore-error=true` because the cache export is an optimisation, not a
+          # result: without it a hiccup in GitHub's cache service fails the whole
+          # build *after* the image has already been built successfully. Two runs
+          # building identical content race to reserve the same key and the loser
+          # dies with "failed to reserve cache" — which the Monday scheduled
+          # rebuild overlapping a push reproduces exactly. A cache miss should
+          # cost a slower build, never a red run.
+          cache-to: type=gha,mode=max,ignore-error=true
           cache-from: type=gha
 
       # `docker build` succeeding proves only that the image assembles. This runs
