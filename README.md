@@ -130,6 +130,11 @@ Defense-in-depth beyond the proxy:
   on the shared Docker network from bypassing Pomerium and reaching the app
   directly. When enabled, set `pass_identity_headers: true` on the Pomerium route
   and provide `POMERIUM_JWKS_URL` and `POMERIUM_AUDIENCE`.
+- **Per-tool policy at the proxy** — MCP `2026-07-28` puts the method and tool
+  name in `Mcp-Method` / `Mcp-Name` headers (e.g. `tools/call` / `delete_event`),
+  so the proxy can deny individual tools, and log them, without parsing the JSON
+  body. The server rejects headers that disagree with the body (`-32020`), so a
+  proxy must forward them unmodified.
 
 ## iCloud setup
 
@@ -165,6 +170,7 @@ the image. Key variables:
 | `STARTUP_TEST` | `false` | Connect and list calendars at startup to verify config. |
 | `MCP_ALLOWED_HOSTS` | — | Allowed `Host` headers (DNS-rebinding guard). Empty = guard off, any host accepted. Set to your Pomerium route host to enable. |
 | `MCP_ALLOWED_ORIGINS` | — | Allowed `Origin` headers. Defaults to `https://` + each allowed host. |
+| `TOOLS_LIST_TTL_MS` | `3600000` | How long clients may cache `tools/list` (MCP `2026-07-28` hint). `0` = always re-fetch. |
 
 ## Run
 
@@ -184,12 +190,13 @@ The image is built and published to GHCR by CI
   `main`, and does a weekly no-cache rebuild so OS/Python security patches land
   even without code changes.
 - **Smoke test** (`scripts/smoke_test.sh`, run by CI before the push step) starts
-  the built image and drives a real MCP `initialize` + `tools/list` against it
-  using a non-localhost `Host` header, then checks that `MCP_ALLOWED_HOSTS`
-  accepts the route host and rejects others. A build alone cannot catch a server
-  that binds the wrong interface or answers `421` to proxied requests — both keep
-  `/healthz` green. Run it locally with `docker build -t caldav-mcp:smoke . &&
-  ./scripts/smoke_test.sh caldav-mcp:smoke`.
+  the built image and drives real MCP traffic at it over a non-localhost `Host`
+  header: a legacy `initialize` + `tools/list`, a sessionless `2026-07-28`
+  request, ICS feed fetching, and `MCP_ALLOWED_HOSTS` accepting the route host
+  while rejecting others. A build alone cannot catch a server that binds the
+  wrong interface, answers `421` to proxied requests, or serves only one protocol
+  era — all keep `/healthz` green. Run it locally with `docker build -t
+  caldav-mcp:smoke . && ./scripts/smoke_test.sh caldav-mcp:smoke`.
 - **Auto-merge** (`dependabot-automerge` workflow) enables auto-merge for
   patch/minor Dependabot bumps once required checks pass; major bumps are left for
   manual review.

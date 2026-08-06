@@ -23,6 +23,7 @@ from icalendar import Calendar as ICalendar
 from icalendar import Event as IEvent
 
 import subscriptions
+from mcp.server.caching import CacheHint
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
@@ -109,7 +110,25 @@ MCP_ALLOWED_ORIGINS = [
     o.strip() for o in os.environ.get("MCP_ALLOWED_ORIGINS", "").split(",") if o.strip()
 ]
 
-mcp = MCPServer("caldav-mcp")
+# How long (ms) a client may reuse a cached `tools/list` result. The catalog is
+# nine tools registered at import time: it cannot change while the process runs,
+# so the only thing that invalidates it is a restart on a new image.
+TOOLS_LIST_TTL_MS = int(os.environ.get("TOOLS_LIST_TTL_MS", str(60 * 60 * 1000)))
+
+mcp = MCPServer(
+    "caldav-mcp",
+    title="CalDAV Calendar",
+    website_url="https://github.com/JB09/caldav-mcp-wrapper",
+    # `cacheScope: public` (MCP 2026-07-28) says a cached result may be shared
+    # across authorization contexts. That is true here and worth being explicit
+    # about, because it is the risky half of the setting: this server does not
+    # vary its catalog by caller — READ_ONLY gates *execution* in
+    # _require_writable(), it does not hide the write tools from `tools/list` —
+    # so no identity-specific data can leak through a shared cache entry. If a
+    # tool is ever registered conditionally on who is asking, this must become
+    # "private".
+    cache_hints={"tools/list": CacheHint(ttl_ms=TOOLS_LIST_TTL_MS, scope="public")},
+)
 
 
 class _HealthzFilter(logging.Filter):
