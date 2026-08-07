@@ -237,4 +237,56 @@ post_mcp "$ROUTE_HOST" \
 grep -q '\-32020' <<<"$BODY" || fail "expected HEADER_MISMATCH (-32020) in: $BODY"
 echo "  OK: header/body agreement enforced"
 
+# --- Phase 5: calendar resolution across duplicate display names -------------
+# A display name can belong to collections of different kinds — an iCloud
+# account with a "Family" calendar *and* a "Family" Reminders list is the real
+# case this was found in, and the Reminders list came back first. Resolving an
+# event query onto the VTODO collection returns `[]`: no error, and identical
+# to a genuinely empty week, so it hides indefinitely. Runs against the real
+# image with a stubbed principal, so it needs no CalDAV account.
+echo "==> phase 5: calendar resolution with duplicate display names"
+docker exec -e CALDAV_USERNAME=smoke -e CALDAV_PASSWORD=smoke \
+  -e SUBSCRIPTIONS_FILE=/tmp/smoke-resolve.json \
+  "$NAME" python - <<'PY' || fail "calendar resolution check failed (see output above)"
+import sys
+import server
+
+class FakeCal:
+    def __init__(self, name, url, comps): self._n, self.url, self._c = name, url, comps
+    def get_display_name(self): return self._n
+    def get_supported_components(self, with_fallback=False): return self._c
+
+# The VTODO "Family" deliberately precedes the VEVENT one: first-match-by-name
+# is the bug, so ordering is the whole point of the fixture.
+ACCOUNT = [
+    FakeCal("Family", "https://x/fam-todo/", ["VTODO"]),
+    FakeCal("Family", "https://x/fam-cal/",  ["VEVENT"]),
+    FakeCal("Home",   "https://x/home/",     ["VEVENT"]),
+    FakeCal("Quiet",  "https://x/quiet/",    []),
+]
+server._get_principal = lambda: type("P", (), {"calendars": lambda self: ACCOUNT})()
+
+cases = [
+    ("duplicate name resolves to the event calendar", ("Family",),          "https://x/fam-cal/"),
+    ("component=VTODO resolves to the task list",     ("Family", "VTODO"),  "https://x/fam-todo/"),
+    ("unique name still resolves",                    ("Home",),            "https://x/home/"),
+    ("explicit URL still wins",                       ("https://x/fam-todo/",), "https://x/fam-todo/"),
+    ("collection advertising no components resolves", ("Quiet",),           "https://x/quiet/"),
+]
+bad = 0
+for label, args, want in cases:
+    got = str(server._resolve_calendar(*args).url)
+    if got != want:
+        print(f"  FAIL {label}: got {got}, want {want}"); bad += 1
+    else:
+        print(f"  - {label}")
+try:
+    server._resolve_calendar("Nonexistent")
+    print("  FAIL missing calendar did not raise"); bad += 1
+except ValueError:
+    print("  - missing calendar still raises ValueError")
+sys.exit(1 if bad else 0)
+PY
+echo "  OK: name collisions resolve by component type"
+
 echo "==> smoke test passed"
