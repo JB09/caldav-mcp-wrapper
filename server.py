@@ -210,7 +210,7 @@ def _calendar_kind(components: list[str]) -> str:
     return "unknown"
 
 
-def _resolve_calendar(name: str | None) -> "caldav.Calendar":
+def _resolve_calendar(name: str | None, component: str = "VEVENT") -> "caldav.Calendar":
     """Resolve a calendar by display name *or* URL, enforcing the allowlist.
 
     `target` may be a calendar URL (as returned by `list_calendars`) — this
@@ -218,6 +218,15 @@ def _resolve_calendar(name: str | None) -> "caldav.Calendar":
     calendars). Otherwise it is matched by display name. The allowlist is checked
     against the resolved calendar's name. Raises ValueError when no calendar is
     selected/found or it is not permitted — all *before* any mutating call.
+
+    A display name can be shared by collections of *different kinds*: an iCloud
+    account with a "Family" calendar and a "Family" Reminders list returns both
+    here, and the Reminders list may come first. Matching purely on name then
+    resolves an event query to a VTODO collection, which answers `[]` — no
+    error, indistinguishable from an empty week. So a name match prefers a
+    collection that actually advertises `component`, and only falls back to the
+    first name match when none does (a server that does not advertise its
+    component set at all must still resolve).
     """
     target = (name or DEFAULT_CALENDAR).strip()
     if not target:
@@ -231,10 +240,12 @@ def _resolve_calendar(name: str | None) -> "caldav.Calendar":
                 match = cal
                 break
     if match is None:
-        for cal in calendars:
-            if _calendar_name(cal) == target:
-                match = cal
-                break
+        named = [cal for cal in calendars if _calendar_name(cal) == target]
+        # Prefer a collection of the right kind; fall back to the first by name.
+        match = next(
+            (cal for cal in named if component in _supported_components(cal)),
+            named[0] if named else None,
+        )
     if match is None:
         raise ValueError(f"Calendar {target!r} was not found in the account.")
 
