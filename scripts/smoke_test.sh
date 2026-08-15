@@ -289,4 +289,103 @@ sys.exit(1 if bad else 0)
 PY
 echo "  OK: name collisions resolve by component type"
 
+# --- Phase 6: resolving an event by UID --------------------------------------
+# get_event/update_event/delete_event all reach their target the same way, so
+# whatever breaks that lookup breaks every one of them at once — which is what
+# happened: iCloud answers a UID-filtered REPORT with a bare 412 (empty body, no
+# DAV:error to read), leaving the account with no way to edit or delete an event
+# while create and list kept working. Coverage that only creates and lists is
+# exactly what let that through, so assert the lookup directly, against a
+# calendar that fails the way iCloud does. Stubbed, so it needs no CalDAV account.
+echo "==> phase 6: UID lookup survives a server that 412s on the UID filter"
+docker exec -e CALDAV_USERNAME=smoke -e CALDAV_PASSWORD=smoke \
+  -e SUBSCRIPTIONS_FILE=/tmp/smoke-uid.json \
+  "$NAME" python - <<'PY' || fail "UID lookup check failed (see output above)"
+import sys
+
+import caldav
+import server
+
+NOW = server.datetime.now(server.timezone.utc)
+SOON = NOW + server.timedelta(days=9)
+FAR = NOW + server.timedelta(days=4000)   # outside UID_SCAN_WINDOW_DAYS
+
+
+class FakeEvent:
+    def __init__(self, uid, when): self.id, self.when, self.deleted = uid, when, False
+    def delete(self): self.deleted = True
+
+
+class FakeCal:
+    """A calendar whose server-side UID filter fails the way iCloud's does."""
+
+    def __init__(self, events, uid_lookup_works=False):
+        self._events, self._uid_lookup_works = events, uid_lookup_works
+        self.searches = []
+
+    def get_display_name(self): return "Family"
+
+    def event_by_uid(self, uid):
+        if not self._uid_lookup_works:
+            raise caldav.error.ReportError("412 Precondition Failed\n\n")
+        for e in self._events:
+            if e.id == uid:
+                return e
+        raise caldav.error.NotFoundError(uid)
+
+    def search(self, start=None, end=None, event=None, expand=None):
+        self.searches.append({"start": start, "end": end, "expand": expand})
+        return [e for e in self._events if start <= e.when < end]
+
+
+EVENTS = [FakeEvent("near@caldav-mcp", SOON), FakeEvent("far@caldav-mcp", FAR)]
+bad = 0
+
+
+def check(label, cond):
+    global bad
+    print(f"  - {label}" if cond else f"  FAIL {label}")
+    bad += 0 if cond else 1
+
+
+# The regression itself: a 412 on the UID filter must not fail the lookup.
+cal = FakeCal(EVENTS)
+check("UID in the scan window resolves despite a 412",
+      server._find_event(cal, "near@caldav-mcp").id == "near@caldav-mcp")
+check("the scan is unexpanded (expanded occurrences carry no href)",
+      all(s["expand"] is False for s in cal.searches))
+
+# An event outside the window must still resolve, or delete/update would report
+# "no such event" for one plainly visible in the calendar.
+cal = FakeCal(EVENTS)
+check("UID outside the window is found by the widened sweep",
+      server._find_event(cal, "far@caldav-mcp").id == "far@caldav-mcp")
+check("the window is tried before the full sweep", len(cal.searches) == 2)
+
+# Genuinely absent has to stay distinguishable from "the lookup broke".
+cal = FakeCal(EVENTS)
+try:
+    server._find_event(cal, "ghost@caldav-mcp")
+    check("missing UID raises NotFoundError", False)
+except caldav.error.NotFoundError as exc:
+    check("missing UID raises NotFoundError", True)
+    check("the error names the server reason the status line swallowed",
+          "412" in str(exc))
+
+# A compliant server must not pay for the workaround.
+cal = FakeCal(EVENTS, uid_lookup_works=True)
+check("a working server-side lookup is used directly, with no scan",
+      server._find_event(cal, "near@caldav-mcp").id == "near@caldav-mcp"
+      and not cal.searches)
+
+# What update_event/delete_event need: a real resource, not a synthesized one.
+cal = FakeCal(EVENTS)
+server._find_event(cal, "near@caldav-mcp").delete()
+check("the scanned object is a stored resource that can be deleted",
+      EVENTS[0].deleted)
+
+sys.exit(1 if bad else 0)
+PY
+echo "  OK: UID lookup falls back to a time-range scan"
+
 echo "==> smoke test passed"

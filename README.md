@@ -147,6 +147,19 @@ Defense-in-depth beyond the proxy:
 
 App-specific passwords require two-factor authentication on your Apple ID.
 
+### iCloud quirk: looking an event up by UID
+
+`get_event`, `update_event` and `delete_event` all start by resolving a UID to a
+stored event. The direct way to do that is a REPORT filtered on UID, and iCloud
+refuses it with a bare `412 Precondition Failed` — empty body, no `DAV:error`
+element naming what it objected to. The filter itself is well-formed and nested
+per RFC 4791; the only structural difference from the date-range queries iCloud
+*does* answer is that a UID lookup carries no `time-range`.
+
+So those three tools fall back to a time-range search and match the UID
+client-side: `UID_SCAN_WINDOW_DAYS` either side of today first, then the whole
+calendar if that misses. A server that can answer the UID filter is never scanned.
+
 ## Configuration
 
 All configuration is via environment variables — see [`.env.example`](.env.example)
@@ -164,6 +177,8 @@ the image. Key variables:
 | `SUBSCRIPTIONS_FILE` | `/data/subscriptions.json` | Persisted ICS pull list; must be on a volume. |
 | `SUBSCRIBED_ICS` | — | Optional JSON `{"name": "url"}` seed merged at startup. |
 | `ALLOWED_SUBSCRIPTIONS` | — | Comma-separated allowlist of feed names/ids; empty = all. |
+| `EXPAND_RECURRENCES` | `true` | Expand recurring events server-side; falls back to an unexpanded query if the server errors. |
+| `UID_SCAN_WINDOW_DAYS` | `366` | Window each side of today scanned when the server cannot resolve a UID itself (see [iCloud setup](#icloud-setup)). A miss widens to the whole calendar. |
 | `ICS_CACHE_TTL` | `900` | Seconds a fetched feed is reused before revalidating. |
 | `ICS_ALLOW_PRIVATE_IPS` | `false` | Allow feeds on private/LAN addresses (SSRF guard off). |
 | `LOG_HEALTHZ` | `false` | Log `/healthz` access lines (noisy; off by default). |
