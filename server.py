@@ -60,6 +60,18 @@ CALDAV_TIMEOUT = int(os.environ.get("CALDAV_TIMEOUT", "20"))
 # within the window. iCloud's expand support is uneven; list_events falls back to
 # an unexpanded query when expansion errors. Set to `false` to skip expand entirely.
 EXPAND_RECURRENCES = os.environ.get("EXPAND_RECURRENCES", "true").lower() == "true"
+# How far either side of today the UID fallback scan looks before widening to the
+# whole calendar — see _find_event(). Only used when the server cannot answer a
+# UID-filtered REPORT (iCloud); a compliant server never gets this far. Most
+# lookups target a recent or upcoming event, so a year each way resolves them in
+# one query while keeping the response small.
+UID_SCAN_WINDOW_DAYS = int(os.environ.get("UID_SCAN_WINDOW_DAYS", "366"))
+# Outer bounds for the widened sweep that runs when the window above misses. Same
+# range python-caldav uses for its own unbounded-search workaround: wide enough to
+# cover any real calendar entry, bounded because several CalDAV servers reject a
+# time-range with no start or end at all.
+UID_SWEEP_START = datetime(1970, 1, 1, tzinfo=timezone.utc)
+UID_SWEEP_END = datetime(2126, 1, 1, tzinfo=timezone.utc)
 
 # Optional app-layer backstop. The external proxy is still REQUIRED regardless.
 # When enabled, /mcp requests must carry a Pomerium identity assertion whose JWT
@@ -399,6 +411,92 @@ def _search_events(cal: "caldav.Calendar", start_dt, end_dt) -> list:
     return summaries
 
 
+def _scan_for_uid(cal: "caldav.Calendar", uid: str, start_dt, end_dt):
+    """Return the stored event with this UID in [start, end), or None.
+
+    `expand=False` is deliberate: an expanded occurrence is a component the
+    library synthesized from an RRULE, not a resource on the server, so it has no
+    href to DELETE or PUT back. The unexpanded search returns the stored objects,
+    and a recurring master matches whenever any of its occurrences falls in the
+    window — which is what a UID lookup wants.
+    """
+    for event in cal.search(start=start_dt, end=end_dt, event=True, expand=False):
+        if event.id == uid:
+            return event
+    return None
+
+
+def _find_event(cal: "caldav.Calendar", uid: str) -> "caldav.Event":
+    """Resolve a UID to the stored event, with a fallback for servers that can't.
+
+    The direct route is `event_by_uid()`, which asks the server for the object via
+    a REPORT carrying a `prop-filter`/`text-match` on UID. iCloud rejects that
+    query with a bare `412 Precondition Failed` — empty body, no `DAV:error`
+    precondition naming what it objected to — which took out `get_event`,
+    `update_event` and `delete_event` while date-range queries kept working. The
+    filter python-caldav emits is well-formed and correctly nested (VCALENDAR >
+    VEVENT > prop-filter name="UID" > text-match collation="i;octet"), and the
+    only structural difference from the queries iCloud does answer is that a UID
+    lookup carries no `time-range`. python-caldav already works around servers
+    that need one, but the workaround is keyed on a quirk profile and iCloud's is
+    commented out upstream, so nothing engages it here.
+
+    So when the server-side lookup fails, fall back to what this account is known
+    to serve: a time-range search, with the UID matched client-side. That covers
+    the 412, and any other reason the lookup could not be answered, without this
+    server having to identify which CalDAV implementation it is talking to.
+
+    Raises caldav.error.NotFoundError when no event carries the UID.
+    """
+    try:
+        return cal.event_by_uid(uid)
+    except Exception as exc:
+        # Debug, not warning: on iCloud this fires on every single lookup and the
+        # fallback below then succeeds, so logging it louder would be pure noise.
+        # The reason is carried into the NotFoundError instead, so it is still
+        # visible in the one case where it explains an actual failure.
+        logger.debug(
+            "Server-side UID lookup for %r failed (%s: %s); falling back to a "
+            "time-range scan.",
+            uid,
+            type(exc).__name__,
+            exc,
+        )
+        lookup_error = exc
+
+    now = datetime.now(timezone.utc)
+    window = timedelta(days=UID_SCAN_WINDOW_DAYS)
+    event = _scan_for_uid(cal, uid, now - window, now + window)
+    if event is not None:
+        return event
+
+    # Widen before believing the event is gone: the window above is a latency
+    # optimisation, not a statement about where events may live.
+    try:
+        event = _scan_for_uid(cal, uid, UID_SWEEP_START, UID_SWEEP_END)
+    except Exception as exc:
+        # A server that refuses the full range (some enforce a minimum date) must
+        # not turn a lookup into an unrelated-looking error, so report it as the
+        # not-found it amounts to — naming both failures, since between them they
+        # say the UID could not be resolved rather than that it does not exist.
+        logger.warning(
+            "Widened UID sweep for %r failed (%s: %s).", uid, type(exc).__name__, exc
+        )
+        raise caldav.error.NotFoundError(
+            f"Could not resolve UID {uid!r} in {_calendar_name(cal)!r}: the "
+            f"server-side lookup failed ({type(lookup_error).__name__}: {lookup_error}) "
+            f"and the fallback scan failed ({type(exc).__name__}: {exc})."
+        ) from exc
+    if event is not None:
+        return event
+
+    raise caldav.error.NotFoundError(
+        f"No event with UID {uid!r} in {_calendar_name(cal)!r}. (The server-side "
+        f"UID lookup was unavailable — {type(lookup_error).__name__}: "
+        f"{lookup_error} — so the calendar was scanned instead.)"
+    )
+
+
 def _set_prop(vevent: IEvent, name: str, value) -> None:
     """Replace (or add) a single VEVENT property."""
     if name in vevent:
@@ -558,7 +656,7 @@ def get_event(uid: str, calendar: str | None = None) -> str:
         return json.dumps(_summarize_component(component) if component is not None else None)
 
     try:
-        event = resolved.event_by_uid(uid)
+        event = _find_event(resolved, uid)
     except caldav.error.NotFoundError:
         return json.dumps(None)
     return json.dumps(_summarize_event(event))
@@ -647,7 +745,7 @@ def update_event(
     """
     _require_writable()
     cal = _resolve_writable(_resolve_target(calendar))
-    event = cal.event_by_uid(uid)
+    event = _find_event(cal, uid)
 
     ical = event.icalendar_instance
     vevent = next(c for c in ical.walk("VEVENT"))
@@ -682,7 +780,7 @@ def delete_event(uid: str, calendar: str | None = None) -> str:
     """
     _require_writable()
     cal = _resolve_writable(_resolve_target(calendar))
-    cal.event_by_uid(uid).delete()
+    _find_event(cal, uid).delete()
     return f"Event {uid} deleted from {_calendar_name(cal)!r}."
 
 
