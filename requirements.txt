@@ -2,7 +2,7 @@
 # Capped below 3.0: server.py is built on `mcp.server.mcpserver.MCPServer`, which
 # replaced the 1.x `mcp.server.fastmcp.FastMCP` entry point in 2.0. Majors are
 # excluded from Dependabot automerge, so a 3.x bump lands as a reviewable PR.
-mcp>=2.0.0,<3
+mcp>=2.1.1,<3
 # CalDAV client — WebDAV + iCalendar over HTTP; talks to iCloud and other servers.
 caldav>=3.2.1
 # iCalendar object model used to build and parse VEVENTs.
