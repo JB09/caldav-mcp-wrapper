@@ -4,7 +4,7 @@
 # excluded from Dependabot automerge, so a 3.x bump lands as a reviewable PR.
 mcp>=2.0.0,<3
 # CalDAV client — WebDAV + iCalendar over HTTP; talks to iCloud and other servers.
-caldav>=3.2.1
+caldav>=3.3.0
 # iCalendar object model used to build and parse VEVENTs.
 icalendar>=7.3.0
 # JWT verification of Pomerium's identity assertion (ES256 needs cryptography).
