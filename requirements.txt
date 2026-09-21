@@ -12,7 +12,7 @@
 # stays manual — same protection, correct classification.
 mcp==2.2.0
 # CalDAV client — WebDAV + iCalendar over HTTP; talks to iCloud and other servers.
-caldav>=3.3.0
+caldav>=3.3.1
 # iCalendar object model used to build and parse VEVENTs.
 icalendar>=7.3.0
 # JWT verification of Pomerium's identity assertion (ES256 needs cryptography).
