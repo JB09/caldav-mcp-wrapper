@@ -282,7 +282,8 @@ class CalendarResolutionTests(unittest.TestCase):
 
     def test_account_name_resolves_when_only_one_calendar_is_available(self):
         calendar = FakeNamedCalendar("Calendário alfaDent User")
-        with mock.patch.object(self.server, "_principal_calendars", return_value=[calendar]), \
+        with mock.patch.object(self.server, "_get_principal"), \
+             mock.patch.object(self.server, "_principal_calendars", return_value=[calendar]), \
              mock.patch.object(self.server, "ALLOWED_CALENDARS", []):
             resolved = self.server._resolve_calendar("mardjor")
         self.assertIs(resolved, calendar)
@@ -292,14 +293,16 @@ class CalendarResolutionTests(unittest.TestCase):
             FakeNamedCalendar("Calendário alfaDent User"),
             FakeNamedCalendar("Other calendar"),
         ]
-        with mock.patch.object(self.server, "_principal_calendars", return_value=calendars), \
+        with mock.patch.object(self.server, "_get_principal"), \
+             mock.patch.object(self.server, "_principal_calendars", return_value=calendars), \
              mock.patch.object(self.server, "ALLOWED_CALENDARS", []):
             with self.assertRaisesRegex(ValueError, "Calendar 'mardjor' was not found"):
                 self.server._resolve_calendar("mardjor")
 
     def test_account_name_alias_still_enforces_calendar_allowlist(self):
         calendar = FakeNamedCalendar("Calendário alfaDent User")
-        with mock.patch.object(self.server, "_principal_calendars", return_value=[calendar]), \
+        with mock.patch.object(self.server, "_get_principal"), \
+             mock.patch.object(self.server, "_principal_calendars", return_value=[calendar]), \
              mock.patch.object(
                  self.server, "ALLOWED_CALENDARS", ["Another calendar"]
              ):
