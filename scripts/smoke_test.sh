@@ -100,12 +100,14 @@ post_mcp "$ROUTE_HOST" -H "mcp-session-id: $session" \
 # Every tool the README documents must be advertised; a partial registration
 # (e.g. a decorator that silently stopped applying) should fail the build.
 for tool in list_calendars list_events get_event create_event update_event \
-            delete_event add_subscription list_subscriptions remove_subscription \
+            add_event_attendee update_event_attendee remove_event_attendee \
+            list_event_attendees delete_event add_subscription list_subscriptions remove_subscription \
             list_contact_books list_contacts get_contact search_contacts \
-            create_contact update_contact delete_contact list_birthdays; do
+            create_contact update_contact get_contact_categories set_contact_categories \
+            add_contact_category remove_contact_category delete_contact list_birthdays; do
   grep -q "\"$tool\"" <<<"$BODY" || fail "tools/list is missing '$tool': $BODY"
 done
-echo "  OK: healthz + initialize + all 17 tools"
+echo "  OK: healthz + initialize + all 25 tools"
 
 # --- Phase 2: the recommended production posture — guard ON ------------------
 # MCP_ALLOWED_HOSTS is what operators are told to set, so prove the control works

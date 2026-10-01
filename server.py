@@ -1340,12 +1340,16 @@ def list_event_attendees(uid: str, calendar: str | None = None) -> str:
             contact = carddav.vcard_to_contact(entry["text"])
             for address in contact.get("emails", []):
                 if address.get("value"):
-                    by_email[address["value"].casefold()] = contact
+                    by_email.setdefault(address["value"].casefold(), {})[
+                        contact.get("uid") or contact.get("full_name")
+                    ] = contact
         for attendee in attendees:
-            contact = by_email.get(attendee["email"].casefold())
-            if contact:
+            matches = list(by_email.get(attendee["email"].casefold(), {}).values())
+            if len(matches) == 1:
+                contact = matches[0]
                 attendee["contact_uid"] = contact.get("uid")
                 attendee["contact_name"] = contact.get("full_name")
+                attendee.setdefault("name", contact.get("full_name"))
     except Exception as exc:
         logger.debug("Could not resolve event attendees against contacts: %s", exc)
     return json.dumps(attendees)

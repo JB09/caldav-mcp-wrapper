@@ -1,6 +1,7 @@
 """Unit tests for complete iCalendar event reads and read-modify-write tools."""
 
 import importlib
+import json
 import os
 import sys
 import unittest
@@ -92,14 +93,16 @@ class EventToolTests(unittest.TestCase):
                     "name": "Aida Maria Ramos Miranda",
                     "role": "REQ-PARTICIPANT",
                     "rsvp": True,
-                }],
+                }, {"email": "second@example.com", "partstat": "TENTATIVE"}],
                 organizer={"email": "host@example.com", "name": "Host"},
                 categories=["Work", "VIP"],
                 custom_fields={"X-EXAMPLE": "value"},
             )
         created = Calendar.from_ical(self.calendar.saved_data)
         event = created.walk("VEVENT")[0]
-        attendee = event["attendee"]
+        attendees = self.server._ical_values(event, "attendee")
+        self.assertEqual(len(attendees), 2)
+        attendee = attendees[0]
         self.assertEqual(str(attendee), "mailto:aida@example.com")
         self.assertEqual(attendee.params["CN"], "Aida Maria Ramos Miranda")
         self.assertEqual(attendee.params["RSVP"], "TRUE")
@@ -108,6 +111,18 @@ class EventToolTests(unittest.TestCase):
         summary = self.server._summarize_component(event)
         self.assertEqual(summary["categories"], ["Work", "VIP"])
         self.assertEqual(summary["custom_fields"]["X-EXAMPLE"], "value")
+
+    def test_create_event_without_attendees_remains_supported(self):
+        with mock.patch.object(self.server, "_resolve_writable", return_value=self.calendar), \
+             mock.patch.object(self.server, "_resolve_target", return_value="Calendar"), \
+             mock.patch.object(self.server, "_calendar_name", return_value="Calendar"):
+            self.server.create_event(
+                "Solo",
+                "2026-10-02T10:00:00+00:00",
+                "2026-10-02T11:00:00+00:00",
+            )
+        event = Calendar.from_ical(self.calendar.saved_data).walk("VEVENT")[0]
+        self.assertEqual(self.server._ical_values(event, "attendee"), [])
 
     def test_update_one_property_preserves_recurrence_attendees_alarm_and_xprop(self):
         event = FakeEvent(_event_text())
@@ -141,6 +156,19 @@ class EventToolTests(unittest.TestCase):
         self.assertEqual(
             organizer.params["SENT-BY"], "mailto:assistant@example.com"
         )
+
+    def test_update_event_custom_property(self):
+        event = FakeEvent(_event_text())
+        with mock.patch.object(self.server, "_resolve_writable", return_value=self.calendar), \
+             mock.patch.object(self.server, "_resolve_target", return_value="Calendar"), \
+             mock.patch.object(self.server, "_find_event", return_value=event), \
+             mock.patch.object(self.server, "_calendar_name", return_value="Calendar"):
+            self.server.update_event(
+                "event-1", custom_fields={"X-EGROUPWARE-PRIVATE": "updated"}
+            )
+        stored = Calendar.from_ical(event.data).walk("VEVENT")[0]
+        self.assertEqual(str(stored["X-EGROUPWARE-PRIVATE"]), "updated")
+        self.assertEqual(len(self.server._ical_values(stored, "attendee")), 2)
 
     def test_attendee_add_update_remove_keeps_other_attendees(self):
         event = FakeEvent(_event_text())
@@ -198,6 +226,24 @@ class EventToolTests(unittest.TestCase):
             email, name = self.server._resolve_attendee_identity(None, "Aida Ramos")
         self.assertEqual(email, "aida@example.com")
         self.assertEqual(name, "Aida Ramos")
+
+    def test_list_attendees_enriches_matching_contact(self):
+        event = FakeEvent(_event_text())
+        entry = {
+            "text": (
+                "BEGIN:VCARD\nVERSION:3.0\nUID:contact-1\nFN:Aida Ramos\n"
+                "EMAIL:aida@example.com\nEND:VCARD\n"
+            )
+        }
+        with mock.patch.object(self.server, "_resolve_calendar", return_value=self.calendar), \
+             mock.patch.object(self.server, "_find_event", return_value=event), \
+             mock.patch.object(self.server, "_get_carddav_client"), \
+             mock.patch.object(self.server, "_resolve_addressbook_url", return_value="book"), \
+             mock.patch.object(self.server.carddav, "fetch_all_vcards", return_value=[entry]):
+            attendees = json.loads(self.server.list_event_attendees("event-1"))
+        aida = next(item for item in attendees if item["email"] == "aida@example.com")
+        self.assertEqual(aida["name"], "Aida")
+        self.assertEqual(aida["contact_uid"], "contact-1")
 
     def test_read_only_rejects_attendee_changes(self):
         server = _server(read_only=True)

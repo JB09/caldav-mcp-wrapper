@@ -190,10 +190,13 @@ class ToolTests(unittest.TestCase):
             )
             self.server.remove_contact_category("u1", "Family")
             removed_text = put.call_args.args[2]
+            self.server.set_contact_categories("u1", [])
+            cleared_text = put.call_args.args[2]
         contact = carddav.vcard_to_contact(removed_text)
         self.assertEqual(contact["categories"], ["Client"])
         self.assertEqual(contact["emails"], [{"type": "HOME", "value": "joao@example.com"}])
         self.assertEqual(contact["custom_fields"]["X-EGROUPWARE-CUSTOM"], "keep")
+        self.assertEqual(carddav.vcard_to_contact(cleared_text)["categories"], [])
 
     def test_category_search_filters_multiple_categories(self):
         entries = []

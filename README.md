@@ -125,13 +125,13 @@ searches names, organization, email, phone, and category, and can additionally
 require one `category` or all values in `categories`.
 
 Calendar event reads include standard fields, `ATTENDEE`, `ORGANIZER`, and
-custom/unmodeled properties, including `X-*`. `update_event` fetches and modifies the existing VEVENT, so
-unmentioned attendees, recurrence rules, alarms, categories, and extension
-properties remain intact. `create_event` accepts attendee objects with `email`,
-optional `name`, `role`, `partstat`, and `rsvp`; use `search_contacts` to resolve
-a person's email first, or pass a name to `add_event_attendee` to resolve an
-exact contact name. Ambiguous contact names are rejected rather than selecting
-an email arbitrarily.
+custom/unmodeled properties, including `X-*`. `update_event` fetches and modifies
+the existing VEVENT, so unmentioned attendees, recurrence rules, alarms,
+categories, and extension properties remain intact. `create_event` accepts
+attendee objects with `email`, optional `name`, `role`, `partstat`, and `rsvp`;
+use `search_contacts` to resolve a person's email first, or pass a name to
+`add_event_attendee` to resolve an exact contact name. Ambiguous contact names
+are rejected rather than selecting an email arbitrarily.
 
 ```text
 create_event(
