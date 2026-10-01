@@ -156,6 +156,32 @@ class DiscoverAddressbooksTests(unittest.TestCase):
         self.assertEqual(set(books[0]["permissions"]), {"read", "write"})
         self.assertEqual(books[0]["components"], ["VCARD"])
 
+    def test_missing_privilege_set_defaults_to_read_only(self):
+        no_privs_xml = f"""<?xml version="1.0" encoding="utf-8"?>
+<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav">
+  <D:response>
+    <D:href>{HOME_URL}</D:href>
+    <D:propstat>
+      <D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+  <D:response>
+    <D:href>{BOOK_URL}</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:resourcetype><D:collection/><C:addressbook/></D:resourcetype>
+        <D:displayname>Contacts</D:displayname>
+      </D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>
+""".encode()
+        client = FakeClient(propfind_bodies=[no_privs_xml])
+        books = carddav.discover_addressbooks(client, HOME_URL)
+        self.assertEqual(books[0]["permissions"], ["read"])
+
 
 class FetchAllVCardsTests(unittest.TestCase):
     def test_lists_members_then_multigets_them(self):

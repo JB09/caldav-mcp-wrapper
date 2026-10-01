@@ -224,7 +224,7 @@ def _single(vcard, name: str) -> str | None:
     return str(child.value) if child is not None else None
 
 
-def _entries(vcard, name: str, value_attr: str = "value") -> list[dict]:
+def _entries(vcard, name: str) -> list[dict]:
     """Return every `name` line as `{"type": ..., "value": ...}`.
 
     `type` is the first `TYPE` parameter when present (e.g. "HOME", "WORK",
@@ -235,8 +235,7 @@ def _entries(vcard, name: str, value_attr: str = "value") -> list[dict]:
     for child in vcard.contents.get(name.lower(), []):
         type_param = child.params.get("TYPE")
         type_value = ",".join(type_param) if type_param else None
-        value = getattr(child, value_attr, child.value)
-        out.append({"type": type_value, "value": str(value)})
+        out.append({"type": type_value, "value": str(child.value)})
     return out
 
 
@@ -524,7 +523,9 @@ def discover_addressbooks(client, home_url: str) -> list[dict]:
 
     Each entry: `{"name", "url", "permissions", "components": ["VCARD"]}`.
     `permissions` is `["read"]` or `["read", "write"]`, best-effort from
-    `current-user-privilege-set` (empty when the server does not advertise it).
+    `current-user-privilege-set`. When the server does not advertise that
+    property at all, `permissions` is conservatively `["read"]` only — write
+    access is never assumed without explicit confirmation from the server.
     """
     response = client.propfind(home_url, props=propfind_addressbooks_body(), depth=1)
     out = []
@@ -539,7 +540,7 @@ def discover_addressbooks(client, home_url: str) -> list[dict]:
             continue  # the home collection itself, not an address book
         privs = privileges(props)
         permissions = ["read"]
-        if not privs or "write" in privs or "all" in privs or "write-content" in privs:
+        if "write" in privs or "all" in privs or "write-content" in privs:
             permissions.append("write")
         display_name = _text(props.get("displayname"))
         out.append(
