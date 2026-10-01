@@ -17,6 +17,14 @@ works with other CalDAV servers, including EGroupware.
 | `list_subscriptions` | List subscribed ICS feeds and their last fetch result. |
 | `add_subscription` | Subscribe to an ICS feed URL. |
 | `remove_subscription` | Stop serving a feed by id, URL, or name. |
+| `list_contact_books` | List address books accessible to the configured contacts owner. |
+| `list_contacts` | List contacts in an address book. |
+| `get_contact` | Fetch a contact by UID. |
+| `search_contacts` | Search contacts by name, organization, email, phone, or category. |
+| `create_contact` | Create a contact. |
+| `update_contact` | Update a contact by UID (read-modify-write; omitted fields are preserved). |
+| `delete_contact` | Delete a contact by UID. |
+| `list_birthdays` | List upcoming birthdays sourced from contacts' `BDAY` field. |
 
 Write tools are disabled when `READ_ONLY=true`. Times use ISO 8601; use
 `YYYY-MM-DD` and `all_day: true` for whole-day events.
@@ -64,6 +72,53 @@ These two settings have different roles:
 
 `ALLOWED_CALENDARS` remains a comma-separated allowlist of calendar display names
 and applies to calendars under the selected owner.
+
+## Contacts (CardDAV)
+
+Contacts/address-book tools work alongside the calendar tools on the same
+server, same credentials. `CALDAV_USERNAME` still authenticates; a separate
+`CARDDAV_CONTACTS_USER` optionally selects the address-book owner, independent
+of `CALDAV_CALENDAR_USER` — the calendar and contacts owners may be the same
+EGroupware account or different ones. If `CARDDAV_CONTACTS_USER` is empty or
+unset, it falls back to `CALDAV_USERNAME`.
+
+For example, with:
+
+```env
+CALDAV_URL=http://192.168.2.122:8082/egroupware/groupdav.php/
+CALDAV_USERNAME=mardjor
+CALDAV_PASSWORD=your-password
+CALDAV_CALENDAR_USER=joao
+CARDDAV_CONTACTS_USER=joao
+```
+
+the MCP authenticates as `mardjor` and directly targets:
+
+```text
+http://192.168.2.122:8082/egroupware/groupdav.php/joao/addressbook/
+```
+
+`list_contact_books` discovers every address book under that owner (their own
+plus any shared ones they have subscribed to in EGroupware's CalDAV
+preferences); the other contact tools default to the owner's own
+`addressbook/` when `address_book` is omitted. `list_contacts`/`search_contacts`
+return structured fields (UID, name, organization, emails, phones, addresses,
+birthday, notes, URL, categories) parsed from each vCard, not raw vCard text.
+
+`update_contact` is read-modify-write: fields left unset are preserved exactly,
+including list fields like emails/phones — "update the phone" never drops the
+email, address, birthday, or notes. `delete_contact`/`update_contact` always
+identify the contact by UID, never by name, so two contacts sharing a display
+name are never confused; use `search_contacts` first to find the right UID.
+
+`list_birthdays` reads the `BDAY` field directly from contacts — it does not
+depend on EGroupware's own birthday calendar events, so it works even when
+`CALDAV_CALENDAR_USER` and `CARDDAV_CONTACTS_USER` point at different accounts.
+Without `start_date`/`end_date` it defaults to the next 30 days; an unknown
+birth year (`--MM-DD`) is reported with `age: null` rather than a guessed age.
+
+`READ_ONLY=true` disables `create_contact`/`update_contact`/`delete_contact`
+exactly like it does the calendar write tools.
 
 ## Subscribed ICS calendars
 
@@ -143,6 +198,7 @@ All configuration is provided through environment variables. See
 | `CALDAV_USERNAME` | — (required) | Authentication identity. |
 | `CALDAV_PASSWORD` | — (required) | CalDAV password or app-specific password. |
 | `CALDAV_CALENDAR_USER` | `CALDAV_USERNAME` | Optional EGroupware calendar owner; does not affect authentication. |
+| `CARDDAV_CONTACTS_USER` | `CALDAV_USERNAME` | Optional EGroupware address-book owner; independent of `CALDAV_CALENDAR_USER`. |
 | `DEFAULT_CALENDAR` | — | Calendar display name used when `calendar` is omitted. |
 | `ALLOWED_CALENDARS` | — | Comma-separated calendar allowlist; empty allows all. |
 | `READ_ONLY` | `false` | Disable calendar and subscription write operations. |

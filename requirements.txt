@@ -29,3 +29,9 @@ httpx2>=2.13.1
 recurring-ical-events>=3.8.2
 # Locking the persisted subscription pull list against concurrent tool calls.
 filelock>=4.0.3
+# vCard parsing/generation for the CardDAV contacts tools. python-caldav (the
+# `caldav` dependency above) has no address-book/vCard support at all; vobject
+# is a small, well-established vCard library that preserves TYPE params
+# (HOME/WORK/CELL) and properties it doesn't otherwise touch — required for
+# update_contact's read-modify-write semantics.
+vobject>=0.9.6.1

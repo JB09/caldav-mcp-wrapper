@@ -22,6 +22,7 @@ import caldav
 from icalendar import Calendar as ICalendar
 from icalendar import Event as IEvent
 
+import carddav
 import subscriptions
 from mcp.server.caching import CacheHint
 from mcp.server.mcpserver import MCPServer
@@ -43,6 +44,11 @@ CALDAV_CALENDAR_USER = os.environ.get("CALDAV_CALENDAR_USER", "").strip()
 # For iCloud this is an app-specific password
 # (Apple ID -> Sign-In and Security -> App-Specific Passwords), NOT your login.
 CALDAV_PASSWORD = os.environ.get("CALDAV_PASSWORD", "")
+# Optional CardDAV address-book owner; authentication still uses
+# CALDAV_USERNAME. Independent of CALDAV_CALENDAR_USER: a deployment may target
+# someone else's calendar and someone else's (or their own) address book.
+# Empty/unset falls back to CALDAV_USERNAME — see _get_contacts_user().
+CARDDAV_CONTACTS_USER = os.environ.get("CARDDAV_CONTACTS_USER", "").strip()
 # Calendar used when a tool call omits `calendar` (matched by display name).
 DEFAULT_CALENDAR = os.environ.get("DEFAULT_CALENDAR", "")
 # Comma-separated allowlist of calendar display names. When set, tools may only
@@ -125,8 +131,9 @@ MCP_ALLOWED_ORIGINS = [
 ]
 
 # How long (ms) a client may reuse a cached `tools/list` result. The catalog is
-# nine tools registered at import time: it cannot change while the process runs,
-# so the only thing that invalidates it is a restart on a new image.
+# fixed at import time (calendar/subscription/contacts tools): it cannot change
+# while the process runs, so the only thing that invalidates it is a restart on
+# a new image.
 TOOLS_LIST_TTL_MS = int(os.environ.get("TOOLS_LIST_TTL_MS", str(60 * 60 * 1000)))
 
 mcp = MCPServer(
@@ -208,6 +215,118 @@ def _principal_calendars(principal: "caldav.Principal") -> list["caldav.Calendar
     if CALDAV_CALENDAR_USER:
         return [principal.client.calendar(url=_egroupware_calendar_url())]
     return principal.calendars()
+
+
+# --- Contacts / CardDAV --------------------------------------------------------
+#
+# Mirrors the calendar owner-selection above: CALDAV_USERNAME always
+# authenticates; CARDDAV_CONTACTS_USER (independent of CALDAV_CALENDAR_USER)
+# selects whose address book is targeted, defaulting to the authenticated user.
+# The heavy lifting (REPORT/PROPFIND bodies, vCard parsing) lives in carddav.py;
+# this server only resolves owner/URL and wires the MCP tools to it.
+
+
+def _get_contacts_user() -> str:
+    """Return the address-book owner, falling back to the authenticated user."""
+    return CARDDAV_CONTACTS_USER or CALDAV_USERNAME
+
+
+def _get_carddav_client() -> "caldav.DAVClient":
+    """Open a fresh CardDAV session (same credentials as _get_principal()).
+
+    A new DAVClient per call for the same staleness reason _get_principal()
+    documents. No principal()/discovery round-trip is needed here: the
+    EGroupware address-book layout is predictable from the owner alone (see
+    _egroupware_addressbook_home_url()), exactly like the direct calendar path.
+    """
+    if not (CALDAV_USERNAME and CALDAV_PASSWORD):
+        raise RuntimeError(
+            "CALDAV_USERNAME and CALDAV_PASSWORD must be configured to reach CardDAV."
+        )
+    return caldav.DAVClient(
+        url=CALDAV_URL,
+        username=CALDAV_USERNAME,
+        password=CALDAV_PASSWORD,
+        timeout=CALDAV_TIMEOUT,
+    )
+
+
+def _egroupware_addressbook_home_url() -> str:
+    """Build the EGroupware home-set URL for the configured contacts owner.
+
+    This is the parent of the owner's address book(s) — `.../<user>/` — used to
+    discover available address books (`list_contact_books`), by direct analogy
+    with `_egroupware_calendar_url()`'s `.../<user>/calendar/`.
+    """
+    from urllib.parse import quote, urlsplit, urlunsplit
+
+    base = urlsplit(CALDAV_URL)
+    base_path = "/" + "/".join(part for part in base.path.split("/") if part)
+    path = f"{base_path.rstrip('/')}/{quote(_get_contacts_user(), safe='')}/"
+    return urlunsplit((base.scheme, base.netloc, path, base.query, base.fragment))
+
+
+def _egroupware_addressbook_url() -> str:
+    """Build the direct EGroupware default address-book URL for the owner."""
+    return f"{_egroupware_addressbook_home_url().rstrip('/')}/addressbook/"
+
+
+def _resolve_addressbook_url(address_book: str | None) -> str:
+    """Resolve the `address_book` tool argument to a collection URL.
+
+    Accepts a URL (as returned by `list_contact_books`) directly, a display
+    name matched against `list_contact_books`, or — when omitted — the default
+    address book for the configured contacts owner.
+    """
+    target = (address_book or "").strip()
+    if not target:
+        return _egroupware_addressbook_url()
+    if target.startswith(("http://", "https://")):
+        return target
+    client = _get_carddav_client()
+    for book in carddav.discover_addressbooks(client, _egroupware_addressbook_home_url()):
+        if book["name"] == target:
+            return book["url"]
+    raise ValueError(f"Address book {target!r} was not found for {_get_contacts_user()!r}.")
+
+
+def _require_contact_writable() -> None:
+    """Guard mutating contact tools when the server is configured read-only."""
+    if READ_ONLY:
+        raise RuntimeError("Server is in READ_ONLY mode; writing tools are disabled.")
+
+
+def _find_contact(client, addressbook_url: str, uid: str) -> dict:
+    """Resolve a contact UID to its `{"href", "etag", "text"}`, or raise.
+
+    Tries the server-side REPORT first; falls back to scanning every vCard in
+    the address book, the same graceful-degradation shape `_find_event` uses
+    for calendars that reject a UID-filtered REPORT.
+    """
+    try:
+        found = carddav.find_vcard_by_uid_server_side(client, addressbook_url, uid)
+        if found is not None:
+            return found
+    except Exception as exc:
+        logger.debug(
+            "Server-side UID lookup for %r failed (%s: %s); scanning the address "
+            "book instead.",
+            uid,
+            type(exc).__name__,
+            exc,
+        )
+        for entry in carddav.fetch_all_vcards(client, addressbook_url):
+            contact = carddav.vcard_to_contact(entry["text"])
+            if contact.get("uid") == uid:
+                return entry
+        raise caldav.error.NotFoundError(
+            f"No contact with UID {uid!r} in {addressbook_url!r}."
+        ) from exc
+    for entry in carddav.fetch_all_vcards(client, addressbook_url):
+        contact = carddav.vcard_to_contact(entry["text"])
+        if contact.get("uid") == uid:
+            return entry
+    raise caldav.error.NotFoundError(f"No contact with UID {uid!r} in {addressbook_url!r}.")
 
 
 def _calendar_name(cal: "caldav.Calendar") -> str:
@@ -899,6 +1018,344 @@ def remove_subscription(id_or_url: str) -> str:
     if removed is None:
         return f"No subscription matched {id_or_url!r}; nothing removed."
     return f"Removed subscription {removed.get('name') or ''!r} (id {removed['id']})."
+
+
+# --- Contacts / CardDAV tools --------------------------------------------------
+
+
+@mcp.tool(annotations=READ)
+def list_contact_books() -> str:
+    """List the CardDAV address books accessible to the configured contacts owner.
+
+    The owner is `CARDDAV_CONTACTS_USER` (falling back to `CALDAV_USERNAME` when
+    unset) — independent of `CALDAV_CALENDAR_USER`. Authentication still always
+    uses `CALDAV_USERNAME`/`CALDAV_PASSWORD`.
+
+    Returns:
+        A JSON array of objects with `name`, `url`, `permissions` (e.g.
+        `["read", "write"]`), and `components` (`["VCARD"]`).
+    """
+    client = _get_carddav_client()
+    books = carddav.discover_addressbooks(client, _egroupware_addressbook_home_url())
+    if not books:
+        # Some EGroupware configurations don't expose the home-set listing to
+        # every account; fall back to probing the owner's default address book
+        # directly, the same resilience _principal_calendars() relies on.
+        url = _egroupware_addressbook_url()
+        carddav.list_member_hrefs(client, url)  # raises if the book is unreachable
+        books = [{"name": "addressbook", "url": url, "permissions": ["read", "write"], "components": ["VCARD"]}]
+    return json.dumps(books)
+
+
+@mcp.tool(annotations=READ)
+def list_contacts(address_book: str | None = None, limit: int | None = None, offset: int = 0) -> str:
+    """List contacts in an address book.
+
+    Args:
+        address_book: Address book display name or URL (from
+            `list_contact_books`). Defaults to the configured contacts owner's
+            default address book when omitted.
+        limit: Maximum number of contacts to return.
+        offset: Number of contacts to skip (for pagination), applied after
+            sorting is NOT guaranteed — the server's own listing order is used.
+
+    Returns:
+        A JSON array of structured contact objects (see `get_contact` for the
+        field list).
+    """
+    client = _get_carddav_client()
+    url = _resolve_addressbook_url(address_book)
+    entries = carddav.fetch_all_vcards(client, url)
+    contacts = [
+        carddav.vcard_to_contact(e["text"], href=e["href"], etag=e["etag"]) for e in entries
+    ]
+    contacts = contacts[offset:]
+    if limit is not None:
+        contacts = contacts[:limit]
+    return json.dumps(contacts)
+
+
+@mcp.tool(annotations=READ)
+def get_contact(uid: str, address_book: str | None = None) -> str:
+    """Fetch a single contact by UID.
+
+    Args:
+        uid: The contact's UID (as returned by `list_contacts`/`search_contacts`/
+            `create_contact`).
+        address_book: Address book display name or URL. Defaults to the
+            configured contacts owner's default address book.
+
+    Returns:
+        A JSON object with the contact's structured fields, or JSON `null` if
+        not found.
+    """
+    client = _get_carddav_client()
+    url = _resolve_addressbook_url(address_book)
+    try:
+        entry = _find_contact(client, url, uid)
+    except caldav.error.NotFoundError:
+        return json.dumps(None)
+    return json.dumps(carddav.vcard_to_contact(entry["text"], href=entry["href"], etag=entry["etag"]))
+
+
+@mcp.tool(annotations=READ)
+def search_contacts(query: str, address_book: str | None = None, limit: int | None = None) -> str:
+    """Search contacts by name, organization, email, phone, or category.
+
+    Tries a server-side CardDAV search first (one request); if the server
+    rejects or does not support it, falls back to fetching the address book
+    once and matching client-side — never more than one round trip either way.
+
+    Args:
+        query: Substring to search for (case-insensitive) across full name,
+            given/family name, organization, emails, phones, and categories.
+        address_book: Address book display name or URL. Defaults to the
+            configured contacts owner's default address book.
+        limit: Maximum number of results to return.
+
+    Returns:
+        A JSON array of structured contact objects matching the query.
+    """
+    client = _get_carddav_client()
+    url = _resolve_addressbook_url(address_book)
+    try:
+        entries = carddav.search_vcards_server_side(client, url, query)
+        contacts = [
+            carddav.vcard_to_contact(e["text"], href=e["href"], etag=e["etag"]) for e in entries
+        ]
+    except Exception as exc:
+        logger.debug(
+            "Server-side contact search failed (%s: %s); scanning the address "
+            "book instead.",
+            type(exc).__name__,
+            exc,
+        )
+        entries = carddav.fetch_all_vcards(client, url)
+        contacts = [
+            carddav.vcard_to_contact(e["text"], href=e["href"], etag=e["etag"]) for e in entries
+        ]
+        contacts = [c for c in contacts if carddav.matches_query(c, query)]
+    if limit is not None:
+        contacts = contacts[:limit]
+    return json.dumps(contacts)
+
+
+@mcp.tool(annotations=CREATE)
+def create_contact(
+    full_name: str | None = None,
+    given_name: str | None = None,
+    family_name: str | None = None,
+    organization: str | None = None,
+    title: str | None = None,
+    emails: list[dict] | None = None,
+    phones: list[dict] | None = None,
+    addresses: list[dict] | None = None,
+    birthday: str | None = None,
+    notes: str | None = None,
+    url: str | None = None,
+    categories: list[str] | None = None,
+    address_book: str | None = None,
+) -> str:
+    """Create a contact.
+
+    At least one of `full_name`, `given_name`, or `family_name` is required.
+
+    Args:
+        full_name: Display name (vCard `FN`). Synthesized from given/family
+            name when omitted.
+        given_name: First name.
+        family_name: Last name / surname.
+        organization: Company/organization name.
+        title: Job title.
+        emails: List of `{"value": "...", "type": "HOME"|"WORK"|...}`.
+        phones: List of `{"value": "...", "type": "CELL"|"HOME"|"WORK"|...}`.
+        addresses: List of `{"type": ..., "street", "city", "region", "code",
+            "country"}` (any may be omitted).
+        birthday: `YYYY-MM-DD`, or `--MM-DD` if the year is unknown.
+        notes: Free-text notes.
+        url: A homepage/profile URL.
+        categories: List of category tags.
+        address_book: Address book display name or URL. Defaults to the
+            configured contacts owner's default address book.
+
+    Returns:
+        A short confirmation string including the new contact's UID.
+    """
+    _require_contact_writable()
+    client = _get_carddav_client()
+    book_url = _resolve_addressbook_url(address_book)
+
+    uid = f"{uuid.uuid4()}"
+    vcard_text = carddav.build_vcard(
+        {
+            "uid": uid,
+            "full_name": full_name,
+            "given_name": given_name,
+            "family_name": family_name,
+            "organization": organization,
+            "title": title,
+            "emails": emails,
+            "phones": phones,
+            "addresses": addresses,
+            "birthday": birthday,
+            "notes": notes,
+            "url": url,
+            "categories": categories,
+        }
+    )
+    href = f"{book_url.rstrip('/')}/{uid}.vcf"
+    carddav.put_vcard(client, href, vcard_text)
+    return f"Contact created with UID {uid}."
+
+
+@mcp.tool(annotations=DESTRUCTIVE)
+def update_contact(
+    uid: str,
+    address_book: str | None = None,
+    full_name: str | None = None,
+    given_name: str | None = None,
+    family_name: str | None = None,
+    organization: str | None = None,
+    title: str | None = None,
+    emails: list[dict] | None = None,
+    phones: list[dict] | None = None,
+    addresses: list[dict] | None = None,
+    birthday: str | None = None,
+    notes: str | None = None,
+    url: str | None = None,
+    categories: list[str] | None = None,
+) -> str:
+    """Update fields of an existing contact, identified by UID.
+
+    Read-modify-write: only the fields explicitly passed are changed, and
+    scalar fields left as `None` (title, organization, birthday, notes, url,
+    full/given/family name) are preserved untouched. List fields (emails,
+    phones, addresses, categories) are replaced *in full* when provided — pass
+    the complete desired list, not just the one entry to change — and are also
+    left untouched when omitted. For example, updating only `phones` never
+    touches the existing email, address, birthday, organization, or notes.
+
+    Args:
+        uid: The UID of the contact to update.
+        address_book: Address book display name or URL. Defaults to the
+            configured contacts owner's default address book.
+        full_name, given_name, family_name, organization, title, emails,
+            phones, addresses, birthday, notes, url, categories: New values, if
+            changing. See `create_contact` for their formats.
+
+    Returns:
+        A short confirmation string.
+    """
+    _require_contact_writable()
+    client = _get_carddav_client()
+    book_url = _resolve_addressbook_url(address_book)
+    entry = _find_contact(client, book_url, uid)
+
+    new_text = carddav.apply_updates(
+        entry["text"],
+        {
+            "full_name": full_name,
+            "given_name": given_name,
+            "family_name": family_name,
+            "organization": organization,
+            "title": title,
+            "emails": emails,
+            "phones": phones,
+            "addresses": addresses,
+            "birthday": birthday,
+            "notes": notes,
+            "url": url,
+            "categories": categories,
+        },
+    )
+    carddav.put_vcard(client, entry["href"], new_text, etag=entry["etag"])
+    return f"Contact {uid} updated."
+
+
+@mcp.tool(annotations=DESTRUCTIVE)
+def delete_contact(uid: str, address_book: str | None = None) -> str:
+    """Delete a contact by UID.
+
+    Identifies the contact strictly by UID — never by name — so two contacts
+    sharing a display name are never confused. If you only have a name, call
+    `search_contacts` first and pass back the UID of the one to delete.
+
+    Args:
+        uid: The UID of the contact to delete.
+        address_book: Address book display name or URL. Defaults to the
+            configured contacts owner's default address book.
+
+    Returns:
+        A short confirmation string.
+    """
+    _require_contact_writable()
+    client = _get_carddav_client()
+    book_url = _resolve_addressbook_url(address_book)
+    entry = _find_contact(client, book_url, uid)
+    carddav.delete_vcard(client, entry["href"], etag=entry["etag"])
+    return f"Contact {uid} deleted."
+
+
+@mcp.tool(annotations=READ)
+def list_birthdays(
+    start_date: str | None = None, end_date: str | None = None, address_book: str | None = None
+) -> str:
+    """List upcoming birthdays, sourced from contacts' `BDAY` field.
+
+    Deliberately independent of any EGroupware-generated calendar birthday
+    events: this reads vCard `BDAY` directly, so it works even when the
+    calendar owner (`CALDAV_CALENDAR_USER`) and contacts owner
+    (`CARDDAV_CONTACTS_USER`) differ or when no birthday calendar exists.
+
+    Args:
+        start_date: Window start as `YYYY-MM-DD` (inclusive). Defaults to today.
+        end_date: Window end as `YYYY-MM-DD` (inclusive). Defaults to 30 days
+            after `start_date`.
+        address_book: Address book display name or URL. Defaults to the
+            configured contacts owner's default address book.
+
+    Returns:
+        A JSON array of objects with `name`, `birthday` (the next occurrence,
+        `YYYY-MM-DD`), `age` (the age they will turn, or `null` when the birth
+        year is unknown), and `uid`, sorted by date. Recurs every year by
+        construction: each entry is the *next* occurrence of that month/day on
+        or after `start_date`.
+    """
+    start = date.fromisoformat(start_date[:10]) if start_date else date.today()
+    end = date.fromisoformat(end_date[:10]) if end_date else start + timedelta(days=30)
+
+    client = _get_carddav_client()
+    book_url = _resolve_addressbook_url(address_book)
+    entries = carddav.fetch_all_vcards(client, book_url)
+
+    results = []
+    for entry in entries:
+        contact = carddav.vcard_to_contact(entry["text"])
+        raw_bday = contact.get("birthday")
+        if not raw_bday:
+            continue
+        try:
+            month, day, year = carddav.parse_birthday(raw_bday)
+        except ValueError:
+            logger.debug("Unparseable BDAY %r for contact %r.", raw_bday, contact.get("uid"))
+            continue
+        occurrence = carddav.next_occurrence(month, day, start)
+        if occurrence > end:
+            continue
+        age = occurrence.year - year if year is not None else None
+        name = contact.get("full_name") or " ".join(
+            p for p in (contact.get("given_name"), contact.get("family_name")) if p
+        )
+        results.append(
+            {
+                "name": name or None,
+                "birthday": occurrence.isoformat(),
+                "age": age,
+                "uid": contact.get("uid"),
+            }
+        )
+    results.sort(key=lambda r: r["birthday"])
+    return json.dumps(results)
 
 
 def _run_startup_test() -> None:

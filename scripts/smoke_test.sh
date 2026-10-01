@@ -100,10 +100,12 @@ post_mcp "$ROUTE_HOST" -H "mcp-session-id: $session" \
 # Every tool the README documents must be advertised; a partial registration
 # (e.g. a decorator that silently stopped applying) should fail the build.
 for tool in list_calendars list_events get_event create_event update_event \
-            delete_event add_subscription list_subscriptions remove_subscription; do
+            delete_event add_subscription list_subscriptions remove_subscription \
+            list_contact_books list_contacts get_contact search_contacts \
+            create_contact update_contact delete_contact list_birthdays; do
   grep -q "\"$tool\"" <<<"$BODY" || fail "tools/list is missing '$tool': $BODY"
 done
-echo "  OK: healthz + initialize + all 9 tools"
+echo "  OK: healthz + initialize + all 17 tools"
 
 # --- Phase 2: the recommended production posture — guard ON ------------------
 # MCP_ALLOWED_HOSTS is what operators are told to set, so prove the control works
@@ -221,7 +223,7 @@ fi
 # since a client that never sees it silently re-fetches the catalog every time.
 grep -q '"ttlMs"' <<<"$BODY" || fail "modern tools/list result is missing ttlMs: $BODY"
 grep -q '"cacheScope":"public"' <<<"$BODY" || fail "modern tools/list result is missing cacheScope: $BODY"
-echo "  OK: 9 tools, no session, cache hint present"
+echo "  OK: 17 tools, no session, cache hint present"
 
 # The 2026-07-28 spec requires Mcp-Method (and Mcp-Name) to mirror the body so
 # gateways can route on headers alone; the SDK rejects a mismatch with
