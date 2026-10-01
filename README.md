@@ -46,6 +46,11 @@ http://192.168.2.122:8082/egroupware/groupdav.php/joao/calendar/
 
 The authenticated user must have permission to access the target calendar in
 EGroupware. `list_calendars` reports the configured owner's accessible calendar.
+The supplied `docker-compose.yml` explicitly forwards each environment variable
+and does not currently include `CALDAV_CALENDAR_USER`; adding it only to `.env`
+will not pass it into that Compose service. Since this change intentionally leaves
+Compose untouched, provide it through a deployment configuration that forwards
+the variable (or add the mapping in your local Compose configuration).
 
 These two settings have different roles:
 
