@@ -77,6 +77,9 @@ These two settings have different roles:
 - `DEFAULT_CALENDAR` selects **which calendar within that owner** to use when a
   tool call omits its `calendar` argument. Pass a display name or URL to a tool
   to select another calendar explicitly.
+- When the account/owner name is passed as `calendar`, it is accepted as an alias
+  only if CalDAV discovery finds exactly one calendar. The normal allowlist still
+  applies to that calendar.
 
 `ALLOWED_CALENDARS` remains a comma-separated allowlist of calendar display names
 and applies to calendars under the selected owner.
