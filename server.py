@@ -38,6 +38,8 @@ logger = logging.getLogger("caldav-mcp")
 CALDAV_URL = os.environ.get("CALDAV_URL", "https://caldav.icloud.com/")
 # For iCloud this is your Apple ID (full email address).
 CALDAV_USERNAME = os.environ.get("CALDAV_USERNAME", "")
+# Optional EGroupware calendar owner; authentication still uses CALDAV_USERNAME.
+CALDAV_CALENDAR_USER = os.environ.get("CALDAV_CALENDAR_USER", "").strip()
 # For iCloud this is an app-specific password
 # (Apple ID -> Sign-In and Security -> App-Specific Passwords), NOT your login.
 CALDAV_PASSWORD = os.environ.get("CALDAV_PASSWORD", "")
@@ -186,6 +188,28 @@ def _get_principal() -> "caldav.Principal":
     return client.principal()
 
 
+def _calendar_user() -> str:
+    """Return the calendar owner, falling back to the authenticated user."""
+    return CALDAV_CALENDAR_USER or CALDAV_USERNAME
+
+
+def _egroupware_calendar_url() -> str:
+    """Build the direct EGroupware calendar URL for the configured owner."""
+    from urllib.parse import quote, urlsplit, urlunsplit
+
+    base = urlsplit(CALDAV_URL)
+    base_path = "/" + "/".join(part for part in base.path.split("/") if part)
+    path = f"{base_path.rstrip('/')}/{quote(_calendar_user(), safe='')}/calendar/"
+    return urlunsplit((base.scheme, base.netloc, path, base.query, base.fragment))
+
+
+def _principal_calendars(principal: "caldav.Principal") -> list["caldav.Calendar"]:
+    """Return calendars for the selected owner, using direct EGroupware access when set."""
+    if CALDAV_CALENDAR_USER:
+        return [principal.client.calendar(url=_egroupware_calendar_url())]
+    return principal.calendars()
+
+
 def _calendar_name(cal: "caldav.Calendar") -> str:
     """Return a calendar's display name across caldav versions.
 
@@ -244,13 +268,18 @@ def _resolve_calendar(name: str | None, component: str = "VEVENT") -> "caldav.Ca
     if not target:
         raise ValueError("No calendar: pass `calendar` or set DEFAULT_CALENDAR.")
 
-    calendars = _get_principal().calendars()
+    principal = _get_principal()
+    calendars = _principal_calendars(principal)
     match = None
     if target.startswith(("http://", "https://")):
         for cal in calendars:
             if str(cal.url).rstrip("/") == target.rstrip("/"):
                 match = cal
                 break
+    elif CALDAV_CALENDAR_USER:
+        calendar = calendars[0]
+        if _calendar_name(calendar) == target:
+            match = calendar
     if match is None:
         named = [cal for cal in calendars if _calendar_name(cal) == target]
         # Prefer a collection of the right kind; fall back to the first by name.
@@ -556,7 +585,7 @@ def list_calendars(kind: str = "calendar") -> str:
     """
     result = []
     if kind in ("calendar", "all"):
-        for cal in _get_principal().calendars():
+        for cal in _principal_calendars(_get_principal()):
             name = _calendar_name(cal)
             if ALLOWED_CALENDARS and name not in ALLOWED_CALENDARS:
                 continue
@@ -576,7 +605,7 @@ def list_calendars(kind: str = "calendar") -> str:
                 }
             )
     elif kind == "tasks":
-        for cal in _get_principal().calendars():
+        for cal in _principal_calendars(_get_principal()):
             name = _calendar_name(cal)
             if ALLOWED_CALENDARS and name not in ALLOWED_CALENDARS:
                 continue

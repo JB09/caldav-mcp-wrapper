@@ -285,6 +285,69 @@ try:
     print("  FAIL missing calendar did not raise"); bad += 1
 except ValueError:
     print("  - missing calendar still raises ValueError")
+
+# EGroupware can expose a different user's calendar directly while the existing
+# principal's client continues to carry the authenticated credentials.
+class FakeClient:
+    def calendar(self, url):
+        self.url = url
+        return FakeCal("Calendário joão", url, ["VEVENT"])
+
+
+direct_client = FakeClient()
+server.CALDAV_URL = "http://192.168.2.122:8082/egroupware//groupdav.php///"
+server.CALDAV_USERNAME = "mardjor"
+server.CALDAV_CALENDAR_USER = "joao"
+server.DEFAULT_CALENDAR = "Calendário joão"
+server.CALDAV_URL = "http://192.168.2.122:8082/egroupware/groupdav.php"
+if server._egroupware_calendar_url() != (
+    "http://192.168.2.122:8082/egroupware/groupdav.php/joao/calendar/"
+):
+    print("  FAIL EGroupware URL without trailing slash"); bad += 1
+else:
+    print("  - EGroupware URL without trailing slash")
+server.CALDAV_URL = "http://192.168.2.122:8082/egroupware//groupdav.php///"
+class FakePrincipal:
+    client = direct_client
+
+    def calendars(self):
+        raise AssertionError(
+            "direct owner targeting must not discover the authenticated user's calendars"
+        )
+
+
+server._get_principal = lambda: FakePrincipal()
+want_url = "http://192.168.2.122:8082/egroupware/groupdav.php/joao/calendar/"
+if server._calendar_user() != "joao" or server._egroupware_calendar_url() != want_url:
+    print("  FAIL EGroupware owner URL normalization"); bad += 1
+else:
+    print("  - EGroupware owner URL normalization")
+if str(server._resolve_calendar(None).url) != want_url:
+    print("  FAIL default calendar resolves directly for configured owner"); bad += 1
+else:
+    print("  - default calendar resolves directly for configured owner")
+if str(server._resolve_calendar(want_url).url) != want_url:
+    print("  FAIL explicit direct calendar URL resolves"); bad += 1
+else:
+    print("  - explicit direct calendar URL resolves")
+server.ALLOWED_CALENDARS = ["Other"]
+try:
+    server._resolve_calendar(None)
+    print("  FAIL configured owner's calendar escaped ALLOWED_CALENDARS"); bad += 1
+except ValueError:
+    print("  - configured owner's calendar remains restricted by ALLOWED_CALENDARS")
+server.ALLOWED_CALENDARS = []
+server.subscriptions.load = lambda: []
+listed = __import__("json").loads(server.list_calendars())
+if len(listed) != 1 or listed[0]["url"] != want_url:
+    print("  FAIL list_calendars reflects configured owner"); bad += 1
+else:
+    print("  - list_calendars reflects configured owner")
+server.CALDAV_CALENDAR_USER = ""
+if server._calendar_user() != "mardjor":
+    print("  FAIL empty owner falls back to authentication identity"); bad += 1
+else:
+    print("  - empty owner falls back to authentication identity")
 sys.exit(1 if bad else 0)
 PY
 echo "  OK: name collisions resolve by component type"
