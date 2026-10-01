@@ -299,6 +299,14 @@ server.CALDAV_URL = "http://192.168.2.122:8082/egroupware//groupdav.php///"
 server.CALDAV_USERNAME = "mardjor"
 server.CALDAV_CALENDAR_USER = "joao"
 server.DEFAULT_CALENDAR = "Calendário joão"
+server.CALDAV_URL = "http://192.168.2.122:8082/egroupware/groupdav.php"
+if server._egroupware_calendar_url() != (
+    "http://192.168.2.122:8082/egroupware/groupdav.php/joao/calendar/"
+):
+    print("  FAIL EGroupware URL without trailing slash"); bad += 1
+else:
+    print("  - EGroupware URL without trailing slash")
+server.CALDAV_URL = "http://192.168.2.122:8082/egroupware//groupdav.php///"
 class FakePrincipal:
     client = direct_client
 
@@ -322,6 +330,13 @@ if str(server._resolve_calendar(want_url).url) != want_url:
     print("  FAIL explicit direct calendar URL resolves"); bad += 1
 else:
     print("  - explicit direct calendar URL resolves")
+server.ALLOWED_CALENDARS = ["Other"]
+try:
+    server._resolve_calendar(None)
+    print("  FAIL configured owner's calendar escaped ALLOWED_CALENDARS"); bad += 1
+except ValueError:
+    print("  - configured owner's calendar remains restricted by ALLOWED_CALENDARS")
+server.ALLOWED_CALENDARS = []
 server.subscriptions.load = lambda: []
 listed = __import__("json").loads(server.list_calendars())
 if len(listed) != 1 or listed[0]["url"] != want_url:
