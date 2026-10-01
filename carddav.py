@@ -23,6 +23,7 @@ the REPORT/PROPFIND bodies are plain RFC 6352.
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from datetime import date
 from urllib.parse import urljoin
@@ -233,9 +234,13 @@ def _entries(vcard, name: str) -> list[dict]:
     """
     out = []
     for child in vcard.contents.get(name.lower(), []):
+        params = {
+            key.lower(): list(value) if isinstance(value, (list, tuple)) else value
+            for key, value in child.params.items()
+        }
         type_param = child.params.get("TYPE")
         type_value = ",".join(type_param) if type_param else None
-        out.append({"type": type_value, "value": str(child.value)})
+        out.append({"type": type_value, "params": params, "value": str(child.value)})
     return out
 
 
@@ -248,6 +253,10 @@ def _addresses(vcard) -> list[dict]:
         out.append(
             {
                 "type": type_value,
+                "params": {
+                    key.lower(): list(value) if isinstance(value, (list, tuple)) else value
+                    for key, value in child.params.items()
+                },
                 "street": getattr(v, "street", "") or None,
                 "city": getattr(v, "city", "") or None,
                 "region": getattr(v, "region", "") or None,
@@ -271,6 +280,18 @@ def vcard_to_contact(vcard_text: str, href: str | None = None, etag: str | None 
         n = vcard.n.value
         given = getattr(n, "given", "") or None
         family = getattr(n, "family", "") or None
+        name_components = {
+            key: getattr(n, key, "") or None
+            for key in ("given", "family", "additional", "prefix", "suffix")
+        }
+    else:
+        name_components = {}
+
+    custom_fields = {}
+    for name, children in vcard.contents.items():
+        if name.upper().startswith("X-"):
+            values = [str(child.value) for child in children]
+            custom_fields[name.upper()] = values[0] if len(values) == 1 else values
 
     return {
         "uid": _single(vcard, "uid"),
@@ -279,8 +300,15 @@ def vcard_to_contact(vcard_text: str, href: str | None = None, etag: str | None 
         "full_name": _single(vcard, "fn"),
         "given_name": given,
         "family_name": family,
+        "name_components": name_components,
         "organization": ", ".join(vcard.org.value) if hasattr(vcard, "org") else None,
         "title": _single(vcard, "title"),
+        "nickname": _single(vcard, "nickname"),
+        "role": _single(vcard, "role"),
+        "kind": _single(vcard, "kind"),
+        "anniversary": _single(vcard, "anniversary"),
+        "impp": _entries(vcard, "impp"),
+        "photos": _entries(vcard, "photo"),
         "emails": _entries(vcard, "email"),
         "phones": _entries(vcard, "tel"),
         "addresses": _addresses(vcard),
@@ -289,6 +317,7 @@ def vcard_to_contact(vcard_text: str, href: str | None = None, etag: str | None 
         "url": _single(vcard, "url"),
         "categories": list(vcard.categories.value) if hasattr(vcard, "categories") else [],
         "modified": _single(vcard, "rev"),
+        "custom_fields": custom_fields,
     }
 
 
@@ -297,10 +326,21 @@ def _apply_type(line, type_value: str | None) -> None:
         line.type_param = type_value
 
 
+def _apply_params(line, params: dict | None) -> None:
+    for key, value in (params or {}).items():
+        normalized = str(key).upper()
+        if normalized == "TYPE":
+            continue
+        line.params[normalized] = value
+
+
 def _set_org(vcard, organization: str) -> None:
+    params = dict(vcard.org.params) if hasattr(vcard, "org") else {}
     if hasattr(vcard, "org"):
         vcard.remove(vcard.org)
-    vcard.add("org").value = [organization]
+    line = vcard.add("org")
+    line.value = [organization]
+    line.params.update(params)
 
 
 def _set_list_field(vcard, name: str, entries: list[dict], value_keys=("value",)) -> None:
@@ -327,13 +367,17 @@ def _set_list_field(vcard, name: str, entries: list[dict], value_keys=("value",)
             line = vcard.add(name.lower())
             line.value = entry.get("value", "")
         _apply_type(line, entry.get("type"))
+        _apply_params(line, entry.get("params"))
 
 
 def _set_scalar(vcard, name: str, value) -> None:
+    params = dict(getattr(vcard, name).params) if hasattr(vcard, name) else {}
     if hasattr(vcard, name):
         vcard.remove(getattr(vcard, name))
     if value is not None:
-        vcard.add(name).value = value
+        line = vcard.add(name)
+        line.value = value
+        line.params.update(params)
 
 
 def build_vcard(fields: dict) -> str:
@@ -356,15 +400,22 @@ def build_vcard(fields: dict) -> str:
     vcard = vobject.vCard()
     vcard.add("uid").value = fields.get("uid") or f"{uuid.uuid4()}"
     vcard.add("fn").value = full_name
-    if fields.get("given_name") or fields.get("family_name"):
+    components = fields.get("name_components") or {}
+    if fields.get("given_name") or fields.get("family_name") or components:
         n = vcard.add("n")
         n.value = vobject.vcard.Name(
-            given=fields.get("given_name") or "", family=fields.get("family_name") or ""
+            given=fields.get("given_name") or "",
+            family=fields.get("family_name") or "",
+            additional=components.get("additional") or "",
+            prefix=components.get("prefix") or "", suffix=components.get("suffix") or "",
         )
     if fields.get("organization"):
         _set_org(vcard, fields["organization"])
     if fields.get("title"):
         vcard.add("title").value = fields["title"]
+    for key in ("nickname", "role", "kind", "anniversary"):
+        if fields.get(key):
+            vcard.add(key).value = fields[key]
     if fields.get("emails"):
         _set_list_field(vcard, "email", fields["emails"])
     if fields.get("phones"):
@@ -379,7 +430,34 @@ def build_vcard(fields: dict) -> str:
         vcard.add("url").value = fields["url"]
     if fields.get("categories"):
         vcard.add("categories").value = list(fields["categories"])
+    if fields.get("impp"):
+        _set_list_field(vcard, "impp", fields["impp"])
+    if fields.get("photos"):
+        _set_list_field(vcard, "photo", fields["photos"])
+    _set_custom_fields(vcard, fields.get("custom_fields"))
     return vcard.serialize()
+
+
+_PROPERTY_NAME = re.compile(r"^[A-Z0-9-]+$")
+
+
+def _set_custom_fields(vcard, custom_fields: dict | None) -> None:
+    """Apply caller-supplied vCard extension properties without touching others."""
+    for raw_name, value in (custom_fields or {}).items():
+        name = str(raw_name).upper()
+        if not _PROPERTY_NAME.fullmatch(name) or not name.startswith("X-"):
+            raise ValueError(f"Custom vCard property {raw_name!r} must be an X- property.")
+        existing_lines = list(vcard.contents.get(name.lower(), []))
+        params = dict(existing_lines[0].params) if existing_lines else {}
+        for existing in existing_lines:
+            vcard.remove(existing)
+        if value is None:
+            continue
+        values = value if isinstance(value, list) else [value]
+        for item in values:
+            line = vcard.add(name.lower())
+            line.value = item
+            line.params.update(params)
 
 
 def apply_updates(vcard_text: str, fields: dict) -> str:
@@ -395,19 +473,27 @@ def apply_updates(vcard_text: str, fields: dict) -> str:
 
     if fields.get("full_name") is not None:
         _set_scalar(vcard, "fn", fields["full_name"])
-    if fields.get("given_name") is not None or fields.get("family_name") is not None:
+    name_components = fields.get("name_components")
+    name_update = fields.get("given_name") is not None or fields.get("family_name") is not None
+    if name_update or name_components is not None:
         existing = vcard.n.value if hasattr(vcard, "n") else vobject.vcard.Name()
+        updates = name_components or {}
         given = fields.get("given_name")
         family = fields.get("family_name")
         n = vcard.add("n") if not hasattr(vcard, "n") else vcard.n
-        n.value = vobject.vcard.Name(
-            given=given if given is not None else getattr(existing, "given", ""),
-            family=family if family is not None else getattr(existing, "family", ""),
-        )
+        existing.given = given if given is not None else getattr(existing, "given", "")
+        existing.family = family if family is not None else getattr(existing, "family", "")
+        for key in ("additional", "prefix", "suffix"):
+            if updates.get(key) is not None:
+                setattr(existing, key, updates[key])
+        n.value = existing
     if fields.get("organization") is not None:
         _set_org(vcard, fields["organization"])
     if fields.get("title") is not None:
         _set_scalar(vcard, "title", fields["title"])
+    for key in ("nickname", "role", "kind", "anniversary"):
+        if fields.get(key) is not None:
+            _set_scalar(vcard, key, fields[key])
     if fields.get("emails") is not None:
         _set_list_field(vcard, "email", fields["emails"])
     if fields.get("phones") is not None:
@@ -422,6 +508,11 @@ def apply_updates(vcard_text: str, fields: dict) -> str:
         _set_scalar(vcard, "url", fields["url"])
     if fields.get("categories") is not None:
         _set_scalar(vcard, "categories", list(fields["categories"]) or None)
+    if fields.get("impp") is not None:
+        _set_list_field(vcard, "impp", fields["impp"])
+    if fields.get("photos") is not None:
+        _set_list_field(vcard, "photo", fields["photos"])
+    _set_custom_fields(vcard, fields.get("custom_fields"))
     return vcard.serialize()
 
 
@@ -442,8 +533,10 @@ def matches_query(contact: dict, query: str) -> bool:
         contact.get("given_name"),
         contact.get("family_name"),
         contact.get("organization"),
+        contact.get("role"),
         *[e.get("value") for e in contact.get("emails", [])],
         *[p.get("value") for p in contact.get("phones", [])],
+        *[e.get("value") for e in contact.get("impp", [])],
         *(contact.get("categories") or []),
     ]
     return any(h and needle in h.lower() for h in haystacks)

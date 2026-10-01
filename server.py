@@ -15,12 +15,15 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import uuid
 from datetime import date, datetime, timedelta, timezone
+from typing import TypedDict
 
 import caldav
 from icalendar import Calendar as ICalendar
 from icalendar import Event as IEvent
+from icalendar import vCalAddress
 
 import carddav
 import subscriptions
@@ -32,6 +35,19 @@ from starlette.requests import Request
 from starlette.responses import PlainTextResponse
 
 logger = logging.getLogger("caldav-mcp")
+
+
+class EventAttendee(TypedDict, total=False):
+    email: str
+    name: str
+    role: str
+    partstat: str
+    rsvp: bool
+
+
+class EventOrganizer(TypedDict, total=False):
+    email: str
+    name: str
 
 # --- Configuration (all from env; secrets injected at runtime, never baked in) ---
 # iCloud's CalDAV entry point. The client performs principal/calendar discovery
@@ -522,15 +538,168 @@ def _isoformat(value) -> str | None:
 
 
 def _summarize_component(comp) -> dict:
-    """Extract the interesting fields of a single VEVENT into a plain dict."""
-    return {
+    """Convert a VEVENT to JSON without hiding attendee or extension properties."""
+    result = {
         "uid": str(comp.get("uid", "")),
         "summary": str(comp.get("summary", "")),
         "start": _isoformat(comp.get("dtstart")),
         "end": _isoformat(comp.get("dtend")),
         "location": str(comp["location"]) if "location" in comp else None,
         "description": str(comp["description"]) if "description" in comp else None,
+        "status": str(comp["status"]) if "status" in comp else None,
+        "class": str(comp["class"]) if "class" in comp else None,
+        "transp": str(comp["transp"]) if "transp" in comp else None,
+        "categories": [str(v) for v in comp["categories"].cats] if "categories" in comp else [],
+        "url": str(comp["url"]) if "url" in comp else None,
+        "priority": int(comp["priority"]) if "priority" in comp else None,
+        "contact": str(comp["contact"]) if "contact" in comp else None,
+        "rrule": _json_safe(dict(comp["rrule"])) if "rrule" in comp else None,
+        "attendees": [_attendee_dict(a) for a in _ical_values(comp, "attendee")],
+        "organizer": _organizer_dict(comp["organizer"]) if "organizer" in comp else None,
     }
+    result["custom_fields"] = _custom_ical_fields(comp)
+    return result
+
+
+def _address_email(value) -> str:
+    text = str(value)
+    return text[7:] if text.lower().startswith("mailto:") else text
+
+
+def _ical_values(component, name: str) -> list:
+    value = component.get(name)
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
+def _json_safe(value):
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _attendee_dict(value) -> dict:
+    params = getattr(value, "params", {})
+    result = {"email": _address_email(value)}
+    for key in ("CN", "ROLE", "PARTSTAT", "RSVP", "CUTYPE",
+                "DELEGATED-FROM", "DELEGATED-TO", "MEMBER", "SCHEDULE-STATUS"):
+        if key in params:
+            field = {
+                "CN": "name",
+                "DELEGATED-FROM": "delegated_from",
+                "DELEGATED-TO": "delegated_to",
+                "SCHEDULE-STATUS": "schedule_status",
+            }.get(key, key.lower())
+            result[field] = (
+                str(params[key]).upper() == "TRUE"
+                if key == "RSVP"
+                else _json_safe(params[key])
+            )
+    return result
+
+
+def _organizer_dict(value) -> dict:
+    params = getattr(value, "params", {})
+    result = {"email": _address_email(value)}
+    if "CN" in params:
+        result["name"] = str(params["CN"])
+    result["params"] = {str(k): str(v) for k, v in params.items()}
+    return result
+
+
+def _custom_ical_fields(component) -> dict:
+    return {
+        name: [str(value) for value in _ical_values(component, name)]
+        if len(_ical_values(component, name)) > 1
+        else str(_ical_values(component, name)[0])
+        for name in component.keys()
+        if str(name).upper().startswith("X-")
+    }
+
+
+def _set_ical_property(component, name: str, value) -> None:
+    if name in component:
+        del component[name]
+    if value is None:
+        return
+    component.add(name, value)
+
+
+_ICAL_PROPERTY_NAME = re.compile(r"^[A-Z0-9-]+$")
+
+
+def _set_custom_ical_fields(component, fields: dict | None) -> None:
+    for raw_name, value in (fields or {}).items():
+        name = str(raw_name).upper()
+        if not _ICAL_PROPERTY_NAME.fullmatch(name) or not name.startswith("X-"):
+            raise ValueError(f"Custom iCalendar property {raw_name!r} must be an X- property.")
+        _set_ical_property(component, name, value)
+
+
+_PARTSTAT_VALUES = {"NEEDS-ACTION", "ACCEPTED", "DECLINED", "TENTATIVE", "DELEGATED"}
+_ROLE_VALUES = {"CHAIR", "REQ-PARTICIPANT", "OPT-PARTICIPANT", "NON-PARTICIPANT"}
+
+
+def _new_attendee(attendee: EventAttendee) -> vCalAddress:
+    email = (attendee.get("email") or "").strip()
+    email = email[7:] if email.lower().startswith("mailto:") else email
+    if not email or "@" not in email:
+        raise ValueError("An attendee email address is required.")
+    value = vCalAddress(f"mailto:{email}")
+    params = value.params
+    if attendee.get("name"):
+        params["CN"] = attendee["name"]
+    if attendee.get("role"):
+        role = attendee["role"].upper()
+        if role not in _ROLE_VALUES:
+            raise ValueError(f"Invalid iCalendar attendee ROLE {role!r}.")
+        params["ROLE"] = role
+    if attendee.get("partstat"):
+        partstat = attendee["partstat"].upper()
+        if partstat not in _PARTSTAT_VALUES:
+            raise ValueError(f"Invalid iCalendar attendee PARTSTAT {partstat!r}.")
+        params["PARTSTAT"] = partstat
+    if attendee.get("rsvp") is not None:
+        params["RSVP"] = "TRUE" if attendee["rsvp"] else "FALSE"
+    return value
+
+
+def _add_attendees(vevent, attendees: list[EventAttendee] | None) -> None:
+    for attendee in attendees or []:
+        value = _new_attendee(attendee)
+        existing = _find_attendee(vevent, attendee.get("email", ""))
+        if existing is None:
+            vevent.add("attendee", value)
+        else:
+            existing.params.update(value.params)
+
+
+def _find_attendee(vevent, email: str):
+    target = email.casefold().removeprefix("mailto:")
+    return next(
+        (a for a in _ical_values(vevent, "attendee") if _address_email(a).casefold() == target),
+        None,
+    )
+
+
+def _set_organizer(vevent, organizer: EventOrganizer | None) -> None:
+    if organizer is None:
+        return
+    value = _new_attendee({"email": organizer.get("email", ""), "name": organizer.get("name")})
+    # Keep existing ORGANIZER parameters not explicitly supplied by this schema.
+    if "organizer" in vevent:
+        previous = vevent["organizer"]
+        for key, param in previous.params.items():
+            if key not in value.params:
+                value.params[key] = param
+    _set_ical_property(vevent, "organizer", value)
 
 
 def _summarize_event(event: "caldav.Event") -> dict:
@@ -829,6 +998,17 @@ def create_event(
     description: str | None = None,
     location: str | None = None,
     all_day: bool = False,
+    attendees: list[EventAttendee] | None = None,
+    organizer: EventOrganizer | None = None,
+    status: str | None = None,
+    event_class: str | None = None,
+    transparency: str | None = None,
+    categories: list[str] | None = None,
+    url: str | None = None,
+    priority: int | None = None,
+    contact: str | None = None,
+    rrule: dict | None = None,
+    custom_fields: dict[str, str | list[str]] | None = None,
 ) -> str:
     """Create a calendar event.
 
@@ -841,6 +1021,13 @@ def create_event(
         description: Optional longer description / notes.
         location: Optional location string.
         all_day: When true, treat start/end as whole-day dates.
+        attendees: Event participants with email, optional name, role, partstat,
+            and RSVP flag. Email may be resolved from the contacts address book
+            by calling `search_contacts` first.
+        organizer: Optional organizer identity with email and display name.
+        status, event_class, transparency, categories, url, priority, contact,
+            rrule: Optional standard iCalendar VEVENT properties.
+        custom_fields: X- extension properties to store in the VEVENT.
 
     Returns:
         A short confirmation string including the new event's UID.
@@ -859,6 +1046,22 @@ def create_event(
         vevent.add("description", description)
     if location:
         vevent.add("location", location)
+    for name, value in (
+        ("status", status),
+        ("class", event_class),
+        ("transp", transparency),
+        ("url", url),
+        ("priority", priority),
+        ("contact", contact),
+        ("rrule", rrule),
+    ):
+        if value is not None:
+            vevent.add(name, value)
+    if categories:
+        vevent.add("categories", categories)
+    _set_organizer(vevent, organizer)
+    _add_attendees(vevent, attendees)
+    _set_custom_ical_fields(vevent, custom_fields)
 
     ical = ICalendar()
     ical.add("prodid", "-//caldav-mcp//EN")
@@ -879,6 +1082,16 @@ def update_event(
     description: str | None = None,
     location: str | None = None,
     all_day: bool = False,
+    status: str | None = None,
+    event_class: str | None = None,
+    transparency: str | None = None,
+    categories: list[str] | None = None,
+    url: str | None = None,
+    priority: int | None = None,
+    contact: str | None = None,
+    rrule: dict | None = None,
+    organizer: EventOrganizer | None = None,
+    custom_fields: dict[str, str | list[str] | None] | None = None,
 ) -> str:
     """Update fields of an existing event, identified by UID.
 
@@ -894,6 +1107,10 @@ def update_event(
         description: New description, if changing.
         location: New location, if changing.
         all_day: Whether provided start/end are whole-day dates.
+        status, event_class, transparency, categories, url, priority, contact,
+            rrule, organizer: New values for the corresponding iCalendar
+            properties, if changing.
+        custom_fields: X- properties to add/update; use null to remove a property.
 
     Returns:
         A short confirmation string.
@@ -914,11 +1131,182 @@ def update_event(
         _set_prop(vevent, "description", description)
     if location is not None:
         _set_prop(vevent, "location", location)
+    for name, value in (
+        ("status", status),
+        ("class", event_class),
+        ("transp", transparency),
+        ("url", url),
+        ("priority", priority),
+        ("contact", contact),
+        ("rrule", rrule),
+        ("categories", categories),
+    ):
+        if value is not None:
+            _set_ical_property(vevent, name, value)
+    _set_organizer(vevent, organizer)
+    _set_custom_ical_fields(vevent, custom_fields)
     _set_prop(vevent, "dtstamp", datetime.now(timezone.utc))
 
     event.data = ical.to_ical()
     event.save()
     return f"Event {uid} updated in {_calendar_name(cal)!r}."
+
+
+def _resolve_attendee_identity(email: str | None, name: str | None) -> tuple[str, str | None]:
+    if email:
+        return email.strip(), name
+    if not name:
+        raise ValueError("Provide an attendee email or a contact name to resolve.")
+    client = _get_carddav_client()
+    book_url = _resolve_addressbook_url(None)
+    try:
+        entries = carddav.search_vcards_server_side(client, book_url, name)
+        if not entries:
+            entries = carddav.fetch_all_vcards(client, book_url)
+    except Exception:
+        entries = carddav.fetch_all_vcards(client, book_url)
+    contacts = [
+        carddav.vcard_to_contact(entry["text"])
+        for entry in entries
+    ]
+    matches = [
+        contact for contact in contacts
+        if (contact.get("full_name") or "").casefold() == name.casefold()
+    ]
+    identities = {
+        (entry.get("value") or "").strip()
+        for contact in matches
+        for entry in contact.get("emails", [])
+        if entry.get("value")
+    }
+    if not matches or not identities:
+        raise ValueError(f"No contact named {name!r} with an email address was found.")
+    if len(identities) != 1:
+        raise ValueError(
+            f"Contact name {name!r} is ambiguous; matching contacts have different "
+            "email addresses. Search contacts and specify the intended email."
+        )
+    return next(iter(identities)), name
+
+
+def _save_attendee_change(event, vevent) -> None:
+    event.data = event.icalendar_instance.to_ical()
+    event.save()
+
+
+@mcp.tool(annotations=DESTRUCTIVE)
+def add_event_attendee(
+    uid: str,
+    email: str | None = None,
+    name: str | None = None,
+    role: str | None = "REQ-PARTICIPANT",
+    partstat: str | None = None,
+    rsvp: bool | None = True,
+    calendar: str | None = None,
+) -> str:
+    """Add a real iCalendar ATTENDEE, by email or by an exact address-book name.
+
+    If name is given without email, it is resolved against CardDAV contacts.
+    Multiple matching email addresses are reported as ambiguous instead of
+    selecting one arbitrarily.
+    """
+    _require_writable()
+    resolved_email, resolved_name = _resolve_attendee_identity(email, name)
+    cal = _resolve_writable(_resolve_target(calendar))
+    event = _find_event(cal, uid)
+    vevent = next(c for c in event.icalendar_instance.walk("VEVENT"))
+    _add_attendees(vevent, [{
+        "email": resolved_email,
+        "name": resolved_name,
+        "role": role,
+        "partstat": partstat,
+        "rsvp": rsvp,
+    }])
+    _save_attendee_change(event, vevent)
+    return f"Attendee {resolved_email} added to event {uid}."
+
+
+@mcp.tool(annotations=DESTRUCTIVE)
+def update_event_attendee(
+    uid: str,
+    email: str,
+    name: str | None = None,
+    role: str | None = None,
+    partstat: str | None = None,
+    rsvp: bool | None = None,
+    calendar: str | None = None,
+) -> str:
+    """Update CN, ROLE, PARTSTAT, and/or RSVP for an existing attendee email."""
+    _require_writable()
+    cal = _resolve_writable(_resolve_target(calendar))
+    event = _find_event(cal, uid)
+    vevent = next(c for c in event.icalendar_instance.walk("VEVENT"))
+    attendee = _find_attendee(vevent, email)
+    if attendee is None:
+        raise ValueError(f"Event {uid} has no attendee {email!r}.")
+    if name is not None:
+        attendee.params["CN"] = name
+    if role is not None:
+        value = role.upper()
+        if value not in _ROLE_VALUES:
+            raise ValueError(f"Invalid iCalendar attendee ROLE {value!r}.")
+        attendee.params["ROLE"] = value
+    if partstat is not None:
+        value = partstat.upper()
+        if value not in _PARTSTAT_VALUES:
+            raise ValueError(f"Invalid iCalendar attendee PARTSTAT {value!r}.")
+        attendee.params["PARTSTAT"] = value
+    if rsvp is not None:
+        attendee.params["RSVP"] = "TRUE" if rsvp else "FALSE"
+    _save_attendee_change(event, vevent)
+    return f"Attendee {email} updated on event {uid}."
+
+
+@mcp.tool(annotations=DESTRUCTIVE)
+def remove_event_attendee(uid: str, email: str, calendar: str | None = None) -> str:
+    """Remove one ATTENDEE by calendar email identity without changing others."""
+    _require_writable()
+    cal = _resolve_writable(_resolve_target(calendar))
+    event = _find_event(cal, uid)
+    ical = event.icalendar_instance
+    vevent = next(c for c in ical.walk("VEVENT"))
+    attendee = _find_attendee(vevent, email)
+    if attendee is None:
+        raise ValueError(f"Event {uid} has no attendee {email!r}.")
+    remaining = [a for a in _ical_values(vevent, "attendee") if a is not attendee]
+    del vevent["ATTENDEE"]
+    for other in remaining:
+        vevent.add("attendee", other)
+    event.data = ical.to_ical()
+    event.save()
+    return f"Attendee {email} removed from event {uid}."
+
+
+@mcp.tool(annotations=READ)
+def list_event_attendees(uid: str, calendar: str | None = None) -> str:
+    """List event attendees; enrich matching emails with contact names and UIDs."""
+    cal = _resolve_calendar(calendar)
+    event = _find_event(cal, uid)
+    vevent = next(c for c in event.icalendar_instance.walk("VEVENT"))
+    attendees = [_attendee_dict(a) for a in _ical_values(vevent, "attendee")]
+    try:
+        client = _get_carddav_client()
+        book_url = _resolve_addressbook_url(None)
+        entries = carddav.fetch_all_vcards(client, book_url)
+        by_email = {}
+        for entry in entries:
+            contact = carddav.vcard_to_contact(entry["text"])
+            for address in contact.get("emails", []):
+                if address.get("value"):
+                    by_email[address["value"].casefold()] = contact
+        for attendee in attendees:
+            contact = by_email.get(attendee["email"].casefold())
+            if contact:
+                attendee["contact_uid"] = contact.get("uid")
+                attendee["contact_name"] = contact.get("full_name")
+    except Exception as exc:
+        logger.debug("Could not resolve event attendees against contacts: %s", exc)
+    return json.dumps(attendees)
 
 
 @mcp.tool(annotations=DESTRUCTIVE)
@@ -1106,7 +1494,13 @@ def get_contact(uid: str, address_book: str | None = None) -> str:
 
 
 @mcp.tool(annotations=READ)
-def search_contacts(query: str, address_book: str | None = None, limit: int | None = None) -> str:
+def search_contacts(
+    query: str,
+    address_book: str | None = None,
+    limit: int | None = None,
+    category: str | None = None,
+    categories: list[str] | None = None,
+) -> str:
     """Search contacts by name, organization, email, phone, or category.
 
     Tries a server-side CardDAV search first (one request); if the server
@@ -1119,6 +1513,8 @@ def search_contacts(query: str, address_book: str | None = None, limit: int | No
         address_book: Address book display name or URL. Defaults to the
             configured contacts owner's default address book.
         limit: Maximum number of results to return.
+        category: Require this exact category (case-insensitive).
+        categories: Require every listed category (case-insensitive).
 
     Returns:
         A JSON array of structured contact objects matching the query.
@@ -1142,6 +1538,16 @@ def search_contacts(query: str, address_book: str | None = None, limit: int | No
             carddav.vcard_to_contact(e["text"], href=e["href"], etag=e["etag"]) for e in entries
         ]
         contacts = [c for c in contacts if carddav.matches_query(c, query)]
+    required_categories = {c.casefold() for c in (categories or [])}
+    if category:
+        required_categories.add(category.casefold())
+    if required_categories:
+        contacts = [
+            contact for contact in contacts
+            if required_categories.issubset(
+                {value.casefold() for value in contact.get("categories", [])}
+            )
+        ]
     if limit is not None:
         contacts = contacts[:limit]
     return json.dumps(contacts)
@@ -1162,6 +1568,16 @@ def create_contact(
     url: str | None = None,
     categories: list[str] | None = None,
     address_book: str | None = None,
+    additional_name: str | None = None,
+    name_prefix: str | None = None,
+    name_suffix: str | None = None,
+    nickname: str | None = None,
+    role: str | None = None,
+    kind: str | None = None,
+    anniversary: str | None = None,
+    impp: list[dict] | None = None,
+    photos: list[dict] | None = None,
+    custom_fields: dict[str, str | list[str]] | None = None,
 ) -> str:
     """Create a contact.
 
@@ -1182,6 +1598,9 @@ def create_contact(
         notes: Free-text notes.
         url: A homepage/profile URL.
         categories: List of category tags.
+        additional_name, name_prefix, name_suffix: Additional vCard N components.
+        nickname, role, kind, anniversary, impp, photos: Additional vCard fields.
+        custom_fields: User-defined X- properties to persist in this vCard.
         address_book: Address book display name or URL. Defaults to the
             configured contacts owner's default address book.
 
@@ -1208,6 +1627,18 @@ def create_contact(
             "notes": notes,
             "url": url,
             "categories": categories,
+            "name_components": {
+                "additional": additional_name,
+                "prefix": name_prefix,
+                "suffix": name_suffix,
+            },
+            "nickname": nickname,
+            "role": role,
+            "kind": kind,
+            "anniversary": anniversary,
+            "impp": impp,
+            "photos": photos,
+            "custom_fields": custom_fields,
         }
     )
     href = f"{book_url.rstrip('/')}/{uid}.vcf"
@@ -1231,24 +1662,31 @@ def update_contact(
     notes: str | None = None,
     url: str | None = None,
     categories: list[str] | None = None,
+    additional_name: str | None = None,
+    name_prefix: str | None = None,
+    name_suffix: str | None = None,
+    nickname: str | None = None,
+    role: str | None = None,
+    kind: str | None = None,
+    anniversary: str | None = None,
+    impp: list[dict] | None = None,
+    photos: list[dict] | None = None,
+    custom_fields: dict[str, str | list[str] | None] | None = None,
 ) -> str:
     """Update fields of an existing contact, identified by UID.
 
     Read-modify-write: only the fields explicitly passed are changed, and
     scalar fields left as `None` (title, organization, birthday, notes, url,
     full/given/family name) are preserved untouched. List fields (emails,
-    phones, addresses, categories) are replaced *in full* when provided — pass
-    the complete desired list, not just the one entry to change — and are also
-    left untouched when omitted. For example, updating only `phones` never
-    touches the existing email, address, birthday, organization, or notes.
+    phones, addresses, categories, IM handles, photos) are replaced *in full*
+    when provided. Every omitted property is preserved from the stored vCard.
 
     Args:
         uid: The UID of the contact to update.
         address_book: Address book display name or URL. Defaults to the
             configured contacts owner's default address book.
-        full_name, given_name, family_name, organization, title, emails,
-            phones, addresses, birthday, notes, url, categories: New values, if
-            changing. See `create_contact` for their formats.
+        All fields are optional. List fields replace their complete values;
+            `custom_fields` updates X- properties, with null removing that key.
 
     Returns:
         A short confirmation string.
@@ -1273,10 +1711,78 @@ def update_contact(
             "notes": notes,
             "url": url,
             "categories": categories,
+            "name_components": {
+                "additional": additional_name,
+                "prefix": name_prefix,
+                "suffix": name_suffix,
+            } if any(v is not None for v in (additional_name, name_prefix, name_suffix)) else None,
+            "nickname": nickname,
+            "role": role,
+            "kind": kind,
+            "anniversary": anniversary,
+            "impp": impp,
+            "photos": photos,
+            "custom_fields": custom_fields,
         },
     )
     carddav.put_vcard(client, entry["href"], new_text, etag=entry["etag"])
     return f"Contact {uid} updated."
+
+
+def _write_contact_categories(uid: str, categories: list[str], address_book: str | None) -> None:
+    _require_contact_writable()
+    client = _get_carddav_client()
+    book_url = _resolve_addressbook_url(address_book)
+    entry = _find_contact(client, book_url, uid)
+    text = carddav.apply_updates(entry["text"], {"categories": categories})
+    carddav.put_vcard(client, entry["href"], text, etag=entry["etag"])
+
+
+@mcp.tool(annotations=READ)
+def get_contact_categories(uid: str, address_book: str | None = None) -> str:
+    """Return a contact's CATEGORIES values."""
+    client = _get_carddav_client()
+    book_url = _resolve_addressbook_url(address_book)
+    entry = _find_contact(client, book_url, uid)
+    return json.dumps(carddav.vcard_to_contact(entry["text"]).get("categories", []))
+
+
+@mcp.tool(annotations=DESTRUCTIVE)
+def set_contact_categories(
+    uid: str, categories: list[str], address_book: str | None = None
+) -> str:
+    """Replace the complete CATEGORIES list; pass an empty list to clear it."""
+    _write_contact_categories(uid, categories, address_book)
+    return f"Categories for contact {uid} replaced."
+
+
+@mcp.tool(annotations=DESTRUCTIVE)
+def add_contact_category(uid: str, category: str, address_book: str | None = None) -> str:
+    """Add a category if it is not already present, ignoring case for duplicates."""
+    _require_contact_writable()
+    client = _get_carddav_client()
+    book_url = _resolve_addressbook_url(address_book)
+    entry = _find_contact(client, book_url, uid)
+    existing = carddav.vcard_to_contact(entry["text"]).get("categories", [])
+    if not any(value.casefold() == category.casefold() for value in existing):
+        existing.append(category)
+    text = carddav.apply_updates(entry["text"], {"categories": existing})
+    carddav.put_vcard(client, entry["href"], text, etag=entry["etag"])
+    return f"Category {category!r} added to contact {uid}."
+
+
+@mcp.tool(annotations=DESTRUCTIVE)
+def remove_contact_category(uid: str, category: str, address_book: str | None = None) -> str:
+    """Remove a category by case-insensitive name without changing other categories."""
+    _require_contact_writable()
+    client = _get_carddav_client()
+    book_url = _resolve_addressbook_url(address_book)
+    entry = _find_contact(client, book_url, uid)
+    existing = carddav.vcard_to_contact(entry["text"]).get("categories", [])
+    updated = [value for value in existing if value.casefold() != category.casefold()]
+    text = carddav.apply_updates(entry["text"], {"categories": updated})
+    carddav.put_vcard(client, entry["href"], text, etag=entry["etag"])
+    return f"Category {category!r} removed from contact {uid}."
 
 
 @mcp.tool(annotations=DESTRUCTIVE)
