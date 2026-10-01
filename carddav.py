@@ -459,9 +459,9 @@ def parse_birthday(value: str) -> tuple[int, int, int | None]:
     Handles the common vCard spellings: a full `YYYY-MM-DD`/`YYYYMMDD` date, and
     a year-less `--MM-DD`/`--MMDD` (vCard 4 "reduced accuracy", also emitted by
     some vCard 3 producers for a birthday with no known year). A handful of
-    servers use an obviously-fake placeholder year (`0000`, `1604`) to mean "no
-    year known" in an otherwise full date; those are treated the same as a
-    year-less value rather than producing a nonsense age.
+    servers use an obviously-fake placeholder year (`0000`, `1604`, `1000`) to
+    mean "no year known" in an otherwise full date; those are treated the same
+    as a year-less value rather than producing a nonsense age.
 
     Raises ValueError if the value cannot be parsed as a date at all.
     """
@@ -579,7 +579,7 @@ def list_member_hrefs(client, addressbook_url: str) -> list[str]:
     return hrefs
 
 
-def _reports_to_vcards(client, addressbook_url: str, response) -> list[dict]:
+def _reports_to_vcards(addressbook_url: str, response) -> list[dict]:
     out = []
     for entry in parse_multistatus_responses(response.tree):
         if entry["status"] >= 300:
@@ -610,7 +610,7 @@ def fetch_all_vcards(client, addressbook_url: str) -> list[dict]:
     if not hrefs:
         return []
     response = client.report(addressbook_url, multiget_body(hrefs), depth=1)
-    return _reports_to_vcards(client, addressbook_url, response)
+    return _reports_to_vcards(addressbook_url, response)
 
 
 def search_vcards_server_side(client, addressbook_url: str, query: str) -> list[dict]:
@@ -620,13 +620,13 @@ def search_vcards_server_side(client, addressbook_url: str, query: str) -> list[
     REPORT); callers fall back to `fetch_all_vcards` + `matches_query`.
     """
     response = client.report(addressbook_url, query_body_for_text(query), depth=1)
-    return _reports_to_vcards(client, addressbook_url, response)
+    return _reports_to_vcards(addressbook_url, response)
 
 
 def find_vcard_by_uid_server_side(client, addressbook_url: str, uid: str) -> dict | None:
     """Server-side exact UID lookup. Raises on failure; see `search_vcards_server_side`."""
     response = client.report(addressbook_url, query_body_for_uid(uid), depth=1)
-    matches = _reports_to_vcards(client, addressbook_url, response)
+    matches = _reports_to_vcards(addressbook_url, response)
     return matches[0] if matches else None
 
 

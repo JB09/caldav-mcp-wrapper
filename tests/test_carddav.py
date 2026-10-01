@@ -158,6 +158,8 @@ class BirthdayTests(unittest.TestCase):
 
     def test_parse_placeholder_year(self):
         self.assertEqual(carddav.parse_birthday("1604-10-04"), (10, 4, None))
+        self.assertEqual(carddav.parse_birthday("1000-10-04"), (10, 4, None))
+        self.assertEqual(carddav.parse_birthday("0000-10-04"), (10, 4, None))
 
     def test_parse_invalid_raises(self):
         with self.assertRaises(ValueError):
