@@ -37,6 +37,15 @@ class FakeCalendar:
         self.saved_data = text
 
 
+class FakeNamedCalendar:
+    def __init__(self, name, components=("VEVENT",)):
+        self.name = name
+        self.components = components
+
+    def get_supported_components(self, with_fallback=True):
+        return self.components
+
+
 def _server(read_only=False):
     env = {
         "CALDAV_URL": "http://example.test/groupdav.php/",
@@ -265,6 +274,40 @@ class EventToolTests(unittest.TestCase):
         server = _server(read_only=True)
         with self.assertRaisesRegex(RuntimeError, "READ_ONLY"):
             server.add_event_attendee("event-1", email="aida@example.com")
+
+
+class CalendarResolutionTests(unittest.TestCase):
+    def setUp(self):
+        self.server = _server()
+
+    def test_account_name_resolves_when_only_one_calendar_is_available(self):
+        calendar = FakeNamedCalendar("Calendário alfaDent User")
+        with mock.patch.object(self.server, "_get_principal"), \
+             mock.patch.object(self.server, "_principal_calendars", return_value=[calendar]), \
+             mock.patch.object(self.server, "ALLOWED_CALENDARS", []):
+            resolved = self.server._resolve_calendar("mardjor")
+        self.assertIs(resolved, calendar)
+
+    def test_account_name_is_not_an_alias_when_multiple_calendars_are_available(self):
+        calendars = [
+            FakeNamedCalendar("Calendário alfaDent User"),
+            FakeNamedCalendar("Other calendar"),
+        ]
+        with mock.patch.object(self.server, "_get_principal"), \
+             mock.patch.object(self.server, "_principal_calendars", return_value=calendars), \
+             mock.patch.object(self.server, "ALLOWED_CALENDARS", []):
+            with self.assertRaisesRegex(ValueError, "Calendar 'mardjor' was not found"):
+                self.server._resolve_calendar("mardjor")
+
+    def test_account_name_alias_still_enforces_calendar_allowlist(self):
+        calendar = FakeNamedCalendar("Calendário alfaDent User")
+        with mock.patch.object(self.server, "_get_principal"), \
+             mock.patch.object(self.server, "_principal_calendars", return_value=[calendar]), \
+             mock.patch.object(
+                 self.server, "ALLOWED_CALENDARS", ["Another calendar"]
+             ):
+            with self.assertRaisesRegex(ValueError, "is not permitted"):
+                self.server._resolve_calendar("mardjor")
 
 
 if __name__ == "__main__":

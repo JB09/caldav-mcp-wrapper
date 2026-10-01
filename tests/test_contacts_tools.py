@@ -63,6 +63,31 @@ class ContactsUserResolutionTests(unittest.TestCase):
         self.assertEqual(server._calendar_user(), "ines")
         self.assertEqual(server._contacts_user(), "joao")
 
+    def test_calendar_owner_override_selects_direct_calendar(self):
+        server = _reload_server({"CALDAV_CALENDAR_USER": "ines"})
+        principal = mock.Mock()
+        expected = mock.sentinel.calendar
+        principal.client.calendar.return_value = expected
+
+        calendars = server._principal_calendars(principal)
+
+        self.assertEqual(calendars, [expected])
+        principal.client.calendar.assert_called_once_with(
+            url="http://example.test/egroupware/groupdav.php/ines/calendar/"
+        )
+        principal.calendars.assert_not_called()
+
+    def test_missing_calendar_owner_uses_authenticated_principal(self):
+        server = _reload_server({"CALDAV_CALENDAR_USER": ""})
+        principal = mock.Mock()
+        expected = [mock.sentinel.calendar]
+        principal.calendars.return_value = expected
+
+        calendars = server._principal_calendars(principal)
+
+        self.assertIs(calendars, expected)
+        principal.client.calendar.assert_not_called()
+
     def test_selected_owner_does_not_change_authentication_identity(self):
         server = _reload_server(
             {"CALDAV_CALENDAR_USER": "joao", "CARDDAV_CONTACTS_USER": "joao"}

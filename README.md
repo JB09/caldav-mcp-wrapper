@@ -62,14 +62,10 @@ http://192.168.2.122:8082/egroupware/groupdav.php/joao/calendar/
 
 The authenticated user must have permission to access the target calendar in
 EGroupware. `list_calendars` reports the configured owner's accessible calendar.
-The Compose file forwards environment variables explicitly, so adding
-`CALDAV_CALENDAR_USER` to `.env` alone is not enough. To use the setting with
-Compose, uncomment the optional mapping under the service's `environment` section
-in `docker-compose.yml`:
-
-```yaml
-CALDAV_CALENDAR_USER: ${CALDAV_CALENDAR_USER:-}
-```
+Compose forwards `CALDAV_CALENDAR_USER` and `CARDDAV_CONTACTS_USER` from the host
+environment or `.env`. Leave either empty to use the authenticated
+`CALDAV_USERNAME` for that resource; set it to use a different owner. The two
+overrides are independent.
 
 These two settings have different roles:
 
@@ -77,6 +73,9 @@ These two settings have different roles:
 - `DEFAULT_CALENDAR` selects **which calendar within that owner** to use when a
   tool call omits its `calendar` argument. Pass a display name or URL to a tool
   to select another calendar explicitly.
+- When the account/owner name is passed as `calendar`, it is accepted as an alias
+  only if CalDAV discovery finds exactly one calendar. The normal allowlist still
+  applies to that calendar.
 
 `ALLOWED_CALENDARS` remains a comma-separated allowlist of calendar display names
 and applies to calendars under the selected owner.

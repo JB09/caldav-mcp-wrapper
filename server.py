@@ -451,6 +451,15 @@ def _resolve_calendar(name: str | None, component: str = "VEVENT") -> "caldav.Ca
             (cal for cal in named if component in _supported_components(cal)),
             named[0] if named else None,
         )
+    # Some clients pass the account/owner name as `calendar`. Accept that alias
+    # only when discovery proves there is exactly one collection to select.
+    if (
+        match is None
+        and not target.startswith(("http://", "https://"))
+        and len(calendars) == 1
+        and target in {CALDAV_USERNAME.strip(), _calendar_user()}
+    ):
+        match = calendars[0]
     if match is None:
         available = ", ".join(repr(_calendar_name(cal)) for cal in calendars) or "none"
         raise ValueError(
