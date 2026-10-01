@@ -6,7 +6,7 @@
 
 services:
   caldav-mcp:
-    image: ${IMAGE:-ghcr.io/jb09/caldav-mcp-wrapper:latest}
+    image: ${IMAGE:-ghcr.io/joralm/caldav-mcp-wrapper-spacial-cal:latest}
     container_name: ${CONTAINER_NAME:-caldav-mcp}
     restart: unless-stopped
     # Each variable is set explicitly so exactly what the app receives is visible
