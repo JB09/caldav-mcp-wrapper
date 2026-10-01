@@ -16,6 +16,9 @@ services:
       CALDAV_URL: ${CALDAV_URL:-https://caldav.icloud.com/}
       CALDAV_USERNAME: ${CALDAV_USERNAME:?CALDAV_USERNAME is required}
       CALDAV_PASSWORD: ${CALDAV_PASSWORD:?CALDAV_PASSWORD is required}
+      # Optional EGroupware calendar owner; authentication remains CALDAV_USERNAME.
+      # Uncomment to forward CALDAV_CALENDAR_USER from the host or .env file.
+      # CALDAV_CALENDAR_USER: ${CALDAV_CALENDAR_USER:-}
       DEFAULT_CALENDAR: ${DEFAULT_CALENDAR:-}
       ALLOWED_CALENDARS: ${ALLOWED_CALENDARS:-}
       READ_ONLY: ${READ_ONLY:-false}
