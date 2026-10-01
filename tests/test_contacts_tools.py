@@ -63,6 +63,16 @@ class ContactsUserResolutionTests(unittest.TestCase):
         self.assertEqual(server._calendar_user(), "ines")
         self.assertEqual(server._contacts_user(), "joao")
 
+    def test_selected_owner_does_not_change_authentication_identity(self):
+        server = _reload_server(
+            {"CALDAV_CALENDAR_USER": "joao", "CARDDAV_CONTACTS_USER": "joao"}
+        )
+        with mock.patch.object(server.caldav, "DAVClient") as dav_client:
+            server._get_carddav_client()
+        self.assertEqual(dav_client.call_args.kwargs["username"], "mardjor")
+        self.assertEqual(server._calendar_user(), "joao")
+        self.assertEqual(server._contacts_user(), "joao")
+
 
 class ToolTests(unittest.TestCase):
     def setUp(self):
@@ -163,6 +173,43 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(contact["organization"], "ACME")
         self.assertEqual(contact["emails"], [{"type": "HOME", "value": "joao@example.com"}])
 
+    def test_category_operations_preserve_other_vcard_data(self):
+        entry = self._entry("u1", "Joao Silva", "u1.vcf")
+        entry["text"] = (
+            "BEGIN:VCARD\nVERSION:3.0\nUID:u1\nFN:Joao Silva\n"
+            "EMAIL;TYPE=HOME:joao@example.com\nCATEGORIES:Client,Family\n"
+            "X-EGROUPWARE-CUSTOM:keep\nEND:VCARD\n"
+        )
+        with mock.patch.object(carddav, "find_vcard_by_uid_server_side", return_value=entry), \
+             mock.patch.object(carddav, "put_vcard") as put:
+            self.server.add_contact_category("u1", "VIP")
+            added_text = put.call_args.args[2]
+            self.assertEqual(
+                set(carddav.vcard_to_contact(added_text)["categories"]),
+                {"Client", "Family", "VIP"},
+            )
+            self.server.remove_contact_category("u1", "Family")
+            removed_text = put.call_args.args[2]
+        contact = carddav.vcard_to_contact(removed_text)
+        self.assertEqual(contact["categories"], ["Client"])
+        self.assertEqual(contact["emails"], [{"type": "HOME", "value": "joao@example.com"}])
+        self.assertEqual(contact["custom_fields"]["X-EGROUPWARE-CUSTOM"], "keep")
+
+    def test_category_search_filters_multiple_categories(self):
+        entries = []
+        for uid, categories in (("u1", "Client,VIP"), ("u2", "Client"), ("u3", "VIP")):
+            entry = self._entry(uid, f"Contact {uid}", f"{uid}.vcf")
+            entry["text"] = (
+                f"BEGIN:VCARD\nVERSION:3.0\nUID:{uid}\nFN:Contact {uid}\n"
+                f"CATEGORIES:{categories}\nEND:VCARD\n"
+            )
+            entries.append(entry)
+        with mock.patch.object(carddav, "search_vcards_server_side", return_value=entries):
+            result = json.loads(
+                self.server.search_contacts("", categories=["Client", "VIP"])
+            )
+        self.assertEqual([contact["uid"] for contact in result], ["u1"])
+
     def test_delete_contact_uses_uid_not_name(self):
         entry = self._entry("u1", "Joao Silva", "u1.vcf")
         with mock.patch.object(carddav, "find_vcard_by_uid_server_side", return_value=entry), \
@@ -223,6 +270,10 @@ class ReadOnlyTests(unittest.TestCase):
     def test_update_contact_blocked(self):
         with self.assertRaises(RuntimeError):
             self.server.update_contact("u1", notes="x")
+
+    def test_category_write_blocked(self):
+        with self.assertRaises(RuntimeError):
+            self.server.add_contact_category("u1", "VIP")
 
     def test_delete_contact_blocked(self):
         with self.assertRaises(RuntimeError):

@@ -18,7 +18,7 @@ import os
 import re
 import uuid
 from datetime import date, datetime, timedelta, timezone
-from typing import TypedDict
+from typing import Literal, NotRequired, TypedDict
 
 import caldav
 from icalendar import Calendar as ICalendar
@@ -37,17 +37,39 @@ from starlette.responses import PlainTextResponse
 logger = logging.getLogger("caldav-mcp")
 
 
-class EventAttendee(TypedDict, total=False):
-    email: str
-    name: str
-    role: str
-    partstat: str
-    rsvp: bool
+AttendeeRole = Literal["CHAIR", "REQ-PARTICIPANT", "OPT-PARTICIPANT", "NON-PARTICIPANT"]
+AttendeePartstat = Literal[
+    "NEEDS-ACTION", "ACCEPTED", "DECLINED", "TENTATIVE", "DELEGATED"
+]
 
 
-class EventOrganizer(TypedDict, total=False):
+class EventAttendee(TypedDict):
     email: str
-    name: str
+    name: NotRequired[str]
+    role: NotRequired[AttendeeRole]
+    partstat: NotRequired[AttendeePartstat]
+    rsvp: NotRequired[bool]
+
+
+class EventOrganizer(TypedDict):
+    email: str
+    name: NotRequired[str]
+
+
+class ContactValue(TypedDict):
+    value: str
+    type: NotRequired[str]
+    params: NotRequired[dict[str, str | list[str]]]
+
+
+class ContactAddress(TypedDict):
+    type: NotRequired[str]
+    params: NotRequired[dict[str, str | list[str]]]
+    street: NotRequired[str]
+    city: NotRequired[str]
+    region: NotRequired[str]
+    code: NotRequired[str]
+    country: NotRequired[str]
 
 # --- Configuration (all from env; secrets injected at runtime, never baked in) ---
 # iCloud's CalDAV entry point. The client performs principal/calendar discovery
@@ -588,6 +610,7 @@ def _json_safe(value):
 def _attendee_dict(value) -> dict:
     params = getattr(value, "params", {})
     result = {"email": _address_email(value)}
+    result["params"] = {str(k): _json_safe(v) for k, v in params.items()}
     for key in ("CN", "ROLE", "PARTSTAT", "RSVP", "CUTYPE",
                 "DELEGATED-FROM", "DELEGATED-TO", "MEMBER", "SCHEDULE-STATUS"):
         if key in params:
@@ -616,11 +639,11 @@ def _organizer_dict(value) -> dict:
 
 def _custom_ical_fields(component) -> dict:
     return {
-        name: [str(value) for value in _ical_values(component, name)]
+        name: [_json_safe(value) for value in _ical_values(component, name)]
         if len(_ical_values(component, name)) > 1
-        else str(_ical_values(component, name)[0])
+        else _json_safe(_ical_values(component, name)[0])
         for name in component.keys()
-        if str(name).upper().startswith("X-")
+        if str(name).upper() not in _EVENT_MAPPED_PROPERTIES
     }
 
 
@@ -633,14 +656,30 @@ def _set_ical_property(component, name: str, value) -> None:
 
 
 _ICAL_PROPERTY_NAME = re.compile(r"^[A-Z0-9-]+$")
+_EVENT_MAPPED_PROPERTIES = {
+    "UID", "SUMMARY", "DTSTART", "DTEND", "LOCATION", "DESCRIPTION", "STATUS",
+    "CLASS", "TRANSP", "CATEGORIES", "URL", "PRIORITY", "CONTACT", "RRULE",
+    "ATTENDEE", "ORGANIZER",
+}
+_EVENT_CUSTOM_PROTECTED_PROPERTIES = {
+    "UID", "DTSTART", "DTEND", "SUMMARY", "DESCRIPTION", "LOCATION", "STATUS",
+    "CLASS", "TRANSP", "CATEGORIES", "URL", "PRIORITY", "CONTACT", "RRULE",
+    "ATTENDEE", "ORGANIZER", "BEGIN", "END", "VERSION",
+}
 
 
 def _set_custom_ical_fields(component, fields: dict | None) -> None:
     for raw_name, value in (fields or {}).items():
         name = str(raw_name).upper()
-        if not _ICAL_PROPERTY_NAME.fullmatch(name) or not name.startswith("X-"):
-            raise ValueError(f"Custom iCalendar property {raw_name!r} must be an X- property.")
-        _set_ical_property(component, name, value)
+        if not _ICAL_PROPERTY_NAME.fullmatch(name) or name in _EVENT_CUSTOM_PROTECTED_PROPERTIES:
+            raise ValueError(f"Custom iCalendar property name {raw_name!r} is invalid or has a dedicated field.")
+        if name in component:
+            del component[name]
+        if value is None:
+            continue
+        values = value if isinstance(value, list) else [value]
+        for item in values:
+            component.add(name, item)
 
 
 _PARTSTAT_VALUES = {"NEEDS-ACTION", "ACCEPTED", "DECLINED", "TENTATIVE", "DELEGATED"}
@@ -1143,9 +1182,9 @@ def update_event(
     ):
         if value is not None:
             _set_ical_property(vevent, name, value)
+    _set_prop(vevent, "dtstamp", datetime.now(timezone.utc))
     _set_organizer(vevent, organizer)
     _set_custom_ical_fields(vevent, custom_fields)
-    _set_prop(vevent, "dtstamp", datetime.now(timezone.utc))
 
     event.data = ical.to_ical()
     event.save()
@@ -1189,8 +1228,8 @@ def _resolve_attendee_identity(email: str | None, name: str | None) -> tuple[str
     return next(iter(identities)), name
 
 
-def _save_attendee_change(event, vevent) -> None:
-    event.data = event.icalendar_instance.to_ical()
+def _save_attendee_change(event, ical) -> None:
+    event.data = ical.to_ical()
     event.save()
 
 
@@ -1199,8 +1238,8 @@ def add_event_attendee(
     uid: str,
     email: str | None = None,
     name: str | None = None,
-    role: str | None = "REQ-PARTICIPANT",
-    partstat: str | None = None,
+    role: AttendeeRole | None = "REQ-PARTICIPANT",
+    partstat: AttendeePartstat | None = None,
     rsvp: bool | None = True,
     calendar: str | None = None,
 ) -> str:
@@ -1214,7 +1253,8 @@ def add_event_attendee(
     resolved_email, resolved_name = _resolve_attendee_identity(email, name)
     cal = _resolve_writable(_resolve_target(calendar))
     event = _find_event(cal, uid)
-    vevent = next(c for c in event.icalendar_instance.walk("VEVENT"))
+    ical = event.icalendar_instance
+    vevent = next(c for c in ical.walk("VEVENT"))
     _add_attendees(vevent, [{
         "email": resolved_email,
         "name": resolved_name,
@@ -1222,7 +1262,7 @@ def add_event_attendee(
         "partstat": partstat,
         "rsvp": rsvp,
     }])
-    _save_attendee_change(event, vevent)
+    _save_attendee_change(event, ical)
     return f"Attendee {resolved_email} added to event {uid}."
 
 
@@ -1231,8 +1271,8 @@ def update_event_attendee(
     uid: str,
     email: str,
     name: str | None = None,
-    role: str | None = None,
-    partstat: str | None = None,
+    role: AttendeeRole | None = None,
+    partstat: AttendeePartstat | None = None,
     rsvp: bool | None = None,
     calendar: str | None = None,
 ) -> str:
@@ -1240,7 +1280,8 @@ def update_event_attendee(
     _require_writable()
     cal = _resolve_writable(_resolve_target(calendar))
     event = _find_event(cal, uid)
-    vevent = next(c for c in event.icalendar_instance.walk("VEVENT"))
+    ical = event.icalendar_instance
+    vevent = next(c for c in ical.walk("VEVENT"))
     attendee = _find_attendee(vevent, email)
     if attendee is None:
         raise ValueError(f"Event {uid} has no attendee {email!r}.")
@@ -1258,7 +1299,7 @@ def update_event_attendee(
         attendee.params["PARTSTAT"] = value
     if rsvp is not None:
         attendee.params["RSVP"] = "TRUE" if rsvp else "FALSE"
-    _save_attendee_change(event, vevent)
+    _save_attendee_change(event, ical)
     return f"Attendee {email} updated on event {uid}."
 
 
@@ -1287,7 +1328,8 @@ def list_event_attendees(uid: str, calendar: str | None = None) -> str:
     """List event attendees; enrich matching emails with contact names and UIDs."""
     cal = _resolve_calendar(calendar)
     event = _find_event(cal, uid)
-    vevent = next(c for c in event.icalendar_instance.walk("VEVENT"))
+    ical = event.icalendar_instance
+    vevent = next(c for c in ical.walk("VEVENT"))
     attendees = [_attendee_dict(a) for a in _ical_values(vevent, "attendee")]
     try:
         client = _get_carddav_client()
@@ -1560,9 +1602,9 @@ def create_contact(
     family_name: str | None = None,
     organization: str | None = None,
     title: str | None = None,
-    emails: list[dict] | None = None,
-    phones: list[dict] | None = None,
-    addresses: list[dict] | None = None,
+    emails: list[ContactValue] | None = None,
+    phones: list[ContactValue] | None = None,
+    addresses: list[ContactAddress] | None = None,
     birthday: str | None = None,
     notes: str | None = None,
     url: str | None = None,
@@ -1575,8 +1617,8 @@ def create_contact(
     role: str | None = None,
     kind: str | None = None,
     anniversary: str | None = None,
-    impp: list[dict] | None = None,
-    photos: list[dict] | None = None,
+    impp: list[ContactValue] | None = None,
+    photos: list[ContactValue] | None = None,
     custom_fields: dict[str, str | list[str]] | None = None,
 ) -> str:
     """Create a contact.
@@ -1600,7 +1642,7 @@ def create_contact(
         categories: List of category tags.
         additional_name, name_prefix, name_suffix: Additional vCard N components.
         nickname, role, kind, anniversary, impp, photos: Additional vCard fields.
-        custom_fields: User-defined X- properties to persist in this vCard.
+        custom_fields: User-defined X- or otherwise unmodeled properties.
         address_book: Address book display name or URL. Defaults to the
             configured contacts owner's default address book.
 
@@ -1655,9 +1697,9 @@ def update_contact(
     family_name: str | None = None,
     organization: str | None = None,
     title: str | None = None,
-    emails: list[dict] | None = None,
-    phones: list[dict] | None = None,
-    addresses: list[dict] | None = None,
+    emails: list[ContactValue] | None = None,
+    phones: list[ContactValue] | None = None,
+    addresses: list[ContactAddress] | None = None,
     birthday: str | None = None,
     notes: str | None = None,
     url: str | None = None,
@@ -1669,8 +1711,8 @@ def update_contact(
     role: str | None = None,
     kind: str | None = None,
     anniversary: str | None = None,
-    impp: list[dict] | None = None,
-    photos: list[dict] | None = None,
+    impp: list[ContactValue] | None = None,
+    photos: list[ContactValue] | None = None,
     custom_fields: dict[str, str | list[str] | None] | None = None,
 ) -> str:
     """Update fields of an existing contact, identified by UID.
@@ -1686,7 +1728,8 @@ def update_contact(
         address_book: Address book display name or URL. Defaults to the
             configured contacts owner's default address book.
         All fields are optional. List fields replace their complete values;
-            `custom_fields` updates X- properties, with null removing that key.
+            `custom_fields` updates X- or otherwise unmodeled properties; null
+            removes the named property.
 
     Returns:
         A short confirmation string.

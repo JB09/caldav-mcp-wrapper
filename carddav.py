@@ -22,6 +22,7 @@ the REPORT/PROPFIND bodies are plain RFC 6352.
 
 from __future__ import annotations
 
+import base64
 import logging
 import re
 import uuid
@@ -237,10 +238,20 @@ def _entries(vcard, name: str) -> list[dict]:
         params = {
             key.lower(): list(value) if isinstance(value, (list, tuple)) else value
             for key, value in child.params.items()
+            if key.upper() != "TYPE"
         }
         type_param = child.params.get("TYPE")
         type_value = ",".join(type_param) if type_param else None
-        out.append({"type": type_value, "params": params, "value": str(child.value)})
+        raw_value = child.value
+        value = (
+            base64.b64encode(raw_value).decode("ascii")
+            if isinstance(raw_value, bytes)
+            else str(raw_value)
+        )
+        entry = {"type": type_value, "value": value}
+        if params:
+            entry["params"] = params
+        out.append(entry)
     return out
 
 
@@ -256,6 +267,7 @@ def _addresses(vcard) -> list[dict]:
                 "params": {
                     key.lower(): list(value) if isinstance(value, (list, tuple)) else value
                     for key, value in child.params.items()
+                    if key.upper() != "TYPE"
                 },
                 "street": getattr(v, "street", "") or None,
                 "city": getattr(v, "city", "") or None,
@@ -287,11 +299,27 @@ def vcard_to_contact(vcard_text: str, href: str | None = None, etag: str | None 
     else:
         name_components = {}
 
+    managed = {
+        "VERSION", "UID", "FN", "N", "ORG", "TITLE", "NICKNAME", "ROLE", "KIND",
+        "ANNIVERSARY", "IMPP", "PHOTO", "EMAIL", "TEL", "ADR", "BDAY", "NOTE",
+        "URL", "CATEGORIES", "REV",
+    }
     custom_fields = {}
     for name, children in vcard.contents.items():
-        if name.upper().startswith("X-"):
+        if name.upper() not in managed:
             values = [str(child.value) for child in children]
             custom_fields[name.upper()] = values[0] if len(values) == 1 else values
+    property_params = {
+        name.upper(): [
+            {
+                key.lower(): list(value) if isinstance(value, (list, tuple)) else value
+                for key, value in child.params.items()
+            }
+            for child in children
+        ]
+        for name, children in vcard.contents.items()
+        if any(child.params for child in children)
+    }
 
     return {
         "uid": _single(vcard, "uid"),
@@ -318,6 +346,7 @@ def vcard_to_contact(vcard_text: str, href: str | None = None, etag: str | None 
         "categories": list(vcard.categories.value) if hasattr(vcard, "categories") else [],
         "modified": _single(vcard, "rev"),
         "custom_fields": custom_fields,
+        "property_params": property_params,
     }
 
 
@@ -400,7 +429,10 @@ def build_vcard(fields: dict) -> str:
     vcard = vobject.vCard()
     vcard.add("uid").value = fields.get("uid") or f"{uuid.uuid4()}"
     vcard.add("fn").value = full_name
-    components = fields.get("name_components") or {}
+    components = {
+        key: value for key, value in (fields.get("name_components") or {}).items()
+        if value is not None
+    }
     if fields.get("given_name") or fields.get("family_name") or components:
         n = vcard.add("n")
         n.value = vobject.vcard.Name(
@@ -439,14 +471,19 @@ def build_vcard(fields: dict) -> str:
 
 
 _PROPERTY_NAME = re.compile(r"^[A-Z0-9-]+$")
+_VCARD_MANAGED_PROPERTIES = {
+    "VERSION", "UID", "FN", "N", "ORG", "TITLE", "NICKNAME", "ROLE", "KIND",
+    "ANNIVERSARY", "IMPP", "PHOTO", "EMAIL", "TEL", "ADR", "BDAY", "NOTE",
+    "URL", "CATEGORIES", "REV", "BEGIN", "END",
+}
 
 
 def _set_custom_fields(vcard, custom_fields: dict | None) -> None:
     """Apply caller-supplied vCard extension properties without touching others."""
     for raw_name, value in (custom_fields or {}).items():
         name = str(raw_name).upper()
-        if not _PROPERTY_NAME.fullmatch(name) or not name.startswith("X-"):
-            raise ValueError(f"Custom vCard property {raw_name!r} must be an X- property.")
+        if not _PROPERTY_NAME.fullmatch(name) or name in _VCARD_MANAGED_PROPERTIES:
+            raise ValueError(f"Custom vCard property name {raw_name!r} is invalid or has a dedicated field.")
         existing_lines = list(vcard.contents.get(name.lower(), []))
         params = dict(existing_lines[0].params) if existing_lines else {}
         for existing in existing_lines:
@@ -532,6 +569,7 @@ def matches_query(contact: dict, query: str) -> bool:
         contact.get("full_name"),
         contact.get("given_name"),
         contact.get("family_name"),
+        contact.get("nickname"),
         contact.get("organization"),
         contact.get("role"),
         *[e.get("value") for e in contact.get("emails", [])],

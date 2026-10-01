@@ -28,6 +28,7 @@ BDAY:1990-10-04
 CATEGORIES:Family,Friends
 NOTE:Met at a conference.
 URL:https://example.com/joao
+X-EGROUPWARE-CUSTOM:custom-value
 END:VCARD
 """
 
@@ -50,6 +51,7 @@ class VCardToContactTests(unittest.TestCase):
         self.assertEqual(set(contact["categories"]), {"Family", "Friends"})
         self.assertEqual(contact["notes"], "Met at a conference.")
         self.assertEqual(contact["url"], "https://example.com/joao")
+        self.assertEqual(contact["custom_fields"]["X-EGROUPWARE-CUSTOM"], "custom-value")
         self.assertEqual(contact["href"], "/x/joao.vcf")
         self.assertEqual(contact["etag"], '"abc"')
 
@@ -97,6 +99,33 @@ class BuildVCardTests(unittest.TestCase):
         self.assertEqual(contact["birthday"], "1985-10-18")
         self.assertEqual(contact["categories"], ["VIP"])
 
+    def test_builds_and_updates_additional_vcard_fields(self):
+        text = carddav.build_vcard({
+            "full_name": "Maria Costa",
+            "name_components": {"additional": "de", "prefix": "Dr."},
+            "nickname": "Mimi",
+            "role": "Director",
+            "kind": "individual",
+            "anniversary": "2001-05-12",
+            "impp": [{"value": "xmpp:maria@example.com", "type": "HOME"}],
+            "custom_fields": {"X-ORIGIN": "CRM"},
+        })
+        contact = carddav.vcard_to_contact(text)
+        self.assertEqual(contact["name_components"]["additional"], "de")
+        self.assertEqual(contact["name_components"]["prefix"], "Dr.")
+        self.assertEqual(contact["nickname"], "Mimi")
+        self.assertEqual(contact["role"], "Director")
+        self.assertEqual(contact["anniversary"], "2001-05-12")
+        self.assertEqual(contact["impp"][0]["value"], "xmpp:maria@example.com")
+        self.assertEqual(contact["custom_fields"]["X-ORIGIN"], "CRM")
+
+        updated = carddav.apply_updates(text, {"role": "CEO"})
+        result = carddav.vcard_to_contact(updated)
+        self.assertEqual(result["role"], "CEO")
+        self.assertEqual(result["nickname"], "Mimi")
+        self.assertEqual(result["impp"], contact["impp"])
+        self.assertEqual(result["custom_fields"], contact["custom_fields"])
+
 
 class ApplyUpdatesTests(unittest.TestCase):
     def test_update_phone_preserves_everything_else(self):
@@ -112,6 +141,8 @@ class ApplyUpdatesTests(unittest.TestCase):
         self.assertEqual(contact["notes"], "Met at a conference.")
         self.assertEqual(len(contact["addresses"]), 1)
         self.assertEqual(set(contact["categories"]), {"Family", "Friends"})
+        self.assertEqual(contact["custom_fields"]["X-EGROUPWARE-CUSTOM"], "custom-value")
+        self.assertEqual(contact["organization"], "ACME Corp")
 
     def test_update_email_does_not_touch_phone_or_address(self):
         updated_text = carddav.apply_updates(
@@ -131,6 +162,29 @@ class ApplyUpdatesTests(unittest.TestCase):
         after = carddav.vcard_to_contact(updated_text)
         self.assertEqual(before, after)
 
+    def test_update_custom_property_preserves_unrequested_properties_and_params(self):
+        text = SAMPLE_VCARD.replace(
+            "TEL;TYPE=CELL:912345678", "TEL;TYPE=CELL;PREF=1:912345678"
+        ).replace("X-EGROUPWARE-CUSTOM:custom-value", "X-EGROUPWARE-CUSTOM:old")
+        updated = carddav.apply_updates(text, {"custom_fields": {"X-EGROUPWARE-CUSTOM": "new"}})
+        contact = carddav.vcard_to_contact(updated)
+        self.assertEqual(contact["custom_fields"]["X-EGROUPWARE-CUSTOM"], "new")
+        self.assertEqual(contact["phones"][0]["params"]["pref"], ["1"])
+        self.assertEqual(contact["emails"][0]["value"], "joao@example.com")
+        self.assertEqual(contact["categories"], ["Family", "Friends"])
+
+    def test_custom_property_can_be_added_and_removed(self):
+        updated = carddav.apply_updates(SAMPLE_VCARD, {"custom_fields": {"X-NEW": "value"}})
+        self.assertEqual(carddav.vcard_to_contact(updated)["custom_fields"]["X-NEW"], "value")
+        cleared = carddav.apply_updates(updated, {"custom_fields": {"X-NEW": None}})
+        self.assertNotIn("X-NEW", carddav.vcard_to_contact(cleared)["custom_fields"])
+
+    def test_scalar_field_update_keeps_vcard_parameters(self):
+        text = SAMPLE_VCARD.replace("BDAY:1990-10-04", "BDAY;VALUE=date:1990-10-04")
+        updated = carddav.apply_updates(text, {"birthday": "1991-10-04"})
+        parsed = __import__("vobject").readOne(updated)
+        self.assertEqual(parsed.bday.params["VALUE"], ["date"])
+
 
 class SearchMatchTests(unittest.TestCase):
     def setUp(self):
@@ -146,6 +200,9 @@ class SearchMatchTests(unittest.TestCase):
 
     def test_no_match(self):
         self.assertFalse(carddav.matches_query(self.contact, "does-not-exist"))
+
+    def test_matches_categories(self):
+        self.assertTrue(carddav.matches_query(self.contact, "Family"))
 
 
 class BirthdayTests(unittest.TestCase):

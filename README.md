@@ -13,6 +13,10 @@ works with other CalDAV servers, including EGroupware.
 | `get_event` | Fetch an event by UID. |
 | `create_event` | Create a timed or all-day event. |
 | `update_event` | Update an event by UID. |
+| `add_event_attendee` | Add an iCalendar participant by email or exact contact name. |
+| `update_event_attendee` | Update an attendee's name, role, RSVP, or participation status. |
+| `remove_event_attendee` | Remove an attendee by email. |
+| `list_event_attendees` | List attendees and resolve matching contacts when possible. |
 | `delete_event` | Delete an event by UID. |
 | `list_subscriptions` | List subscribed ICS feeds and their last fetch result. |
 | `add_subscription` | Subscribe to an ICS feed URL. |
@@ -23,6 +27,10 @@ works with other CalDAV servers, including EGroupware.
 | `search_contacts` | Search contacts by name, organization, email, phone, or category. |
 | `create_contact` | Create a contact. |
 | `update_contact` | Update a contact by UID (read-modify-write; omitted fields are preserved). |
+| `get_contact_categories` | Read a contact's categories. |
+| `set_contact_categories` | Replace or clear a contact's categories. |
+| `add_contact_category` | Add one category without creating duplicates. |
+| `remove_contact_category` | Remove one category. |
 | `delete_contact` | Delete a contact by UID. |
 | `list_birthdays` | List upcoming birthdays sourced from contacts' `BDAY` field. |
 
@@ -103,13 +111,39 @@ plus any shared ones they have subscribed to in EGroupware's CalDAV
 preferences); the other contact tools default to the owner's own
 `addressbook/` when `address_book` is omitted. `list_contacts`/`search_contacts`
 return structured fields (UID, name, organization, emails, phones, addresses,
-birthday, notes, URL, categories) parsed from each vCard, not raw vCard text.
+birthday, notes, URL, categories, additional standard fields, and custom/unmodeled
+properties (including `X-*`) parsed from each vCard, not raw vCard text.
 
 `update_contact` is read-modify-write: fields left unset are preserved exactly,
 including list fields like emails/phones — "update the phone" never drops the
 email, address, birthday, or notes. `delete_contact`/`update_contact` always
 identify the contact by UID, never by name, so two contacts sharing a display
 name are never confused; use `search_contacts` first to find the right UID.
+Updating categories replaces the full list; the category-specific tools add or
+remove one value while preserving the other categories. `search_contacts`
+searches names, organization, email, phone, and category, and can additionally
+require one `category` or all values in `categories`.
+
+Calendar event reads include standard fields, `ATTENDEE`, `ORGANIZER`, and
+custom/unmodeled properties, including `X-*`. `update_event` fetches and modifies the existing VEVENT, so
+unmentioned attendees, recurrence rules, alarms, categories, and extension
+properties remain intact. `create_event` accepts attendee objects with `email`,
+optional `name`, `role`, `partstat`, and `rsvp`; use `search_contacts` to resolve
+a person's email first, or pass a name to `add_event_attendee` to resolve an
+exact contact name. Ambiguous contact names are rejected rather than selecting
+an email arbitrarily.
+
+```text
+create_event(
+  summary="Reunião",
+  start="2026-10-02T10:00:00+01:00",
+  end="2026-10-02T11:00:00+01:00",
+  attendees=[{"name": "Aida Maria Ramos Miranda", "email": "aida@example.com",
+              "role": "REQ-PARTICIPANT", "rsvp": true}]
+)
+update_event_attendee(uid="...", email="aida@example.com", partstat="ACCEPTED")
+set_contact_categories(uid="...", categories=["Cliente", "VIP"])
+```
 
 `list_birthdays` reads the `BDAY` field directly from contacts — it does not
 depend on EGroupware's own birthday calendar events, so it works even when
