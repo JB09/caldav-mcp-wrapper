@@ -47,7 +47,7 @@ CALDAV_PASSWORD = os.environ.get("CALDAV_PASSWORD", "")
 # Optional CardDAV address-book owner; authentication still uses
 # CALDAV_USERNAME. Independent of CALDAV_CALENDAR_USER: a deployment may target
 # someone else's calendar and someone else's (or their own) address book.
-# Empty/unset falls back to CALDAV_USERNAME — see _get_contacts_user().
+# Empty/unset falls back to CALDAV_USERNAME — see _contacts_user().
 CARDDAV_CONTACTS_USER = os.environ.get("CARDDAV_CONTACTS_USER", "").strip()
 # Calendar used when a tool call omits `calendar` (matched by display name).
 DEFAULT_CALENDAR = os.environ.get("DEFAULT_CALENDAR", "")
@@ -226,7 +226,7 @@ def _principal_calendars(principal: "caldav.Principal") -> list["caldav.Calendar
 # this server only resolves owner/URL and wires the MCP tools to it.
 
 
-def _get_contacts_user() -> str:
+def _contacts_user() -> str:
     """Return the address-book owner, falling back to the authenticated user."""
     return CARDDAV_CONTACTS_USER or CALDAV_USERNAME
 
@@ -262,7 +262,7 @@ def _egroupware_addressbook_home_url() -> str:
 
     base = urlsplit(CALDAV_URL)
     base_path = "/" + "/".join(part for part in base.path.split("/") if part)
-    path = f"{base_path.rstrip('/')}/{quote(_get_contacts_user(), safe='')}/"
+    path = f"{base_path.rstrip('/')}/{quote(_contacts_user(), safe='')}/"
     return urlunsplit((base.scheme, base.netloc, path, base.query, base.fragment))
 
 
@@ -287,13 +287,22 @@ def _resolve_addressbook_url(address_book: str | None) -> str:
     for book in carddav.discover_addressbooks(client, _egroupware_addressbook_home_url()):
         if book["name"] == target:
             return book["url"]
-    raise ValueError(f"Address book {target!r} was not found for {_get_contacts_user()!r}.")
+    raise ValueError(f"Address book {target!r} was not found for {_contacts_user()!r}.")
 
 
 def _require_contact_writable() -> None:
     """Guard mutating contact tools when the server is configured read-only."""
     if READ_ONLY:
         raise RuntimeError("Server is in READ_ONLY mode; writing tools are disabled.")
+
+
+def _scan_contacts_for_uid(client, addressbook_url: str, uid: str) -> dict | None:
+    """Scan every vCard in the address book for one matching `uid`, or `None`."""
+    for entry in carddav.fetch_all_vcards(client, addressbook_url):
+        contact = carddav.vcard_to_contact(entry["text"])
+        if contact.get("uid") == uid:
+            return entry
+    return None
 
 
 def _find_contact(client, addressbook_url: str, uid: str) -> dict:
@@ -315,17 +324,15 @@ def _find_contact(client, addressbook_url: str, uid: str) -> dict:
             type(exc).__name__,
             exc,
         )
-        for entry in carddav.fetch_all_vcards(client, addressbook_url):
-            contact = carddav.vcard_to_contact(entry["text"])
-            if contact.get("uid") == uid:
-                return entry
+        found = _scan_contacts_for_uid(client, addressbook_url, uid)
+        if found is not None:
+            return found
         raise caldav.error.NotFoundError(
             f"No contact with UID {uid!r} in {addressbook_url!r}."
         ) from exc
-    for entry in carddav.fetch_all_vcards(client, addressbook_url):
-        contact = carddav.vcard_to_contact(entry["text"])
-        if contact.get("uid") == uid:
-            return entry
+    found = _scan_contacts_for_uid(client, addressbook_url, uid)
+    if found is not None:
+        return found
     raise caldav.error.NotFoundError(f"No contact with UID {uid!r} in {addressbook_url!r}.")
 
 
@@ -1056,8 +1063,8 @@ def list_contacts(address_book: str | None = None, limit: int | None = None, off
             `list_contact_books`). Defaults to the configured contacts owner's
             default address book when omitted.
         limit: Maximum number of contacts to return.
-        offset: Number of contacts to skip (for pagination), applied after
-            sorting is NOT guaranteed — the server's own listing order is used.
+        offset: Number of contacts to skip (for pagination). No particular
+            sort order is guaranteed — the server's own listing order is used.
 
     Returns:
         A JSON array of structured contact objects (see `get_contact` for the
@@ -1337,7 +1344,7 @@ def list_birthdays(
         try:
             month, day, year = carddav.parse_birthday(raw_bday)
         except ValueError:
-            logger.debug("Unparseable BDAY %r for contact %r.", raw_bday, contact.get("uid"))
+            logger.debug("Unparseable BDAY value for contact %r.", contact.get("uid"))
             continue
         occurrence = carddav.next_occurrence(month, day, start)
         if occurrence > end:

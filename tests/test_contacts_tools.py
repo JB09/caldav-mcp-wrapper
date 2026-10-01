@@ -41,7 +41,7 @@ def _reload_server(extra_env=None):
 class ContactsUserResolutionTests(unittest.TestCase):
     def test_explicit_contacts_user(self):
         server = _reload_server({"CALDAV_CALENDAR_USER": "joao", "CARDDAV_CONTACTS_USER": "joao"})
-        self.assertEqual(server._get_contacts_user(), "joao")
+        self.assertEqual(server._contacts_user(), "joao")
         self.assertEqual(
             server._egroupware_addressbook_url(),
             "http://example.test/egroupware/groupdav.php/joao/addressbook/",
@@ -49,7 +49,7 @@ class ContactsUserResolutionTests(unittest.TestCase):
 
     def test_empty_contacts_user_falls_back_to_caldav_username(self):
         server = _reload_server({"CARDDAV_CONTACTS_USER": ""})
-        self.assertEqual(server._get_contacts_user(), "mardjor")
+        self.assertEqual(server._contacts_user(), "mardjor")
         self.assertEqual(
             server._egroupware_addressbook_url(),
             "http://example.test/egroupware/groupdav.php/mardjor/addressbook/",
@@ -61,7 +61,7 @@ class ContactsUserResolutionTests(unittest.TestCase):
             {"CALDAV_CALENDAR_USER": "ines", "CARDDAV_CONTACTS_USER": "joao"}
         )
         self.assertEqual(server._calendar_user(), "ines")
-        self.assertEqual(server._get_contacts_user(), "joao")
+        self.assertEqual(server._contacts_user(), "joao")
 
 
 class ToolTests(unittest.TestCase):
