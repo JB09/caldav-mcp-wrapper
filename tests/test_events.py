@@ -235,7 +235,8 @@ class EventToolTests(unittest.TestCase):
                 "EMAIL:aida@example.com\nEND:VCARD\n"
             )
         }
-        with mock.patch.object(self.server, "_resolve_calendar", return_value=self.calendar), \
+        with mock.patch.object(self.server, "_resolve_target", return_value="Calendar"), \
+             mock.patch.object(self.server, "_resolve_any", return_value=("calendar", self.calendar)), \
              mock.patch.object(self.server, "_find_event", return_value=event), \
              mock.patch.object(self.server, "_get_carddav_client"), \
              mock.patch.object(self.server, "_resolve_addressbook_url", return_value="book"), \
@@ -244,6 +245,21 @@ class EventToolTests(unittest.TestCase):
         aida = next(item for item in attendees if item["email"] == "aida@example.com")
         self.assertEqual(aida["name"], "Aida")
         self.assertEqual(aida["contact_uid"], "contact-1")
+
+    def test_list_attendees_reads_subscription_feed(self):
+        ical = Calendar.from_ical(_event_text())
+        vevent = next(c for c in ical.walk("VEVENT"))
+        with mock.patch.object(self.server, "_resolve_target", return_value="Feed"), \
+             mock.patch.object(
+                 self.server, "_resolve_any",
+                 return_value=("subscription", {"id": "feed-1", "url": "https://example/feed.ics"}),
+             ), \
+             mock.patch.object(self.server.subscriptions, "find_event", return_value=vevent), \
+             mock.patch.object(self.server, "_get_carddav_client"), \
+             mock.patch.object(self.server, "_resolve_addressbook_url", return_value="book"), \
+             mock.patch.object(self.server.carddav, "fetch_all_vcards", return_value=[]):
+            attendees = json.loads(self.server.list_event_attendees("event-1", calendar="Feed"))
+        self.assertEqual({a["email"] for a in attendees}, {"aida@example.com", "bob@example.com"})
 
     def test_read_only_rejects_attendee_changes(self):
         server = _server(read_only=True)
