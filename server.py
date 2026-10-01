@@ -452,7 +452,11 @@ def _resolve_calendar(name: str | None, component: str = "VEVENT") -> "caldav.Ca
             named[0] if named else None,
         )
     if match is None:
-        raise ValueError(f"Calendar {target!r} was not found in the account.")
+        available = ", ".join(repr(_calendar_name(cal)) for cal in calendars) or "none"
+        raise ValueError(
+            f"Calendar {target!r} was not found in the account. "
+            f"Available calendars: {available}."
+        )
 
     # Calendar hard-limit: even a misused tool cannot touch calendars off the list.
     resolved = _calendar_name(match)
@@ -1325,11 +1329,22 @@ def remove_event_attendee(uid: str, email: str, calendar: str | None = None) -> 
 
 @mcp.tool(annotations=READ)
 def list_event_attendees(uid: str, calendar: str | None = None) -> str:
-    """List event attendees; enrich matching emails with contact names and UIDs."""
-    cal = _resolve_calendar(calendar)
-    event = _find_event(cal, uid)
-    ical = event.icalendar_instance
-    vevent = next(c for c in ical.walk("VEVENT"))
+    """List event attendees; enrich matching emails with contact names and UIDs.
+
+    Args:
+        uid: The event UID (as returned by create/list tools).
+        calendar: Calendar display name/URL, or a subscription id/URL/name. Falls
+            back to DEFAULT_CALENDAR.
+    """
+    kind, resolved = _resolve_any(_resolve_target(calendar))
+    if kind == "subscription":
+        vevent = subscriptions.find_event(resolved, uid)
+        if vevent is None:
+            raise ValueError(f"Event {uid!r} was not found.")
+    else:
+        event = _find_event(resolved, uid)
+        ical = event.icalendar_instance
+        vevent = next(c for c in ical.walk("VEVENT"))
     attendees = [_attendee_dict(a) for a in _ical_values(vevent, "attendee")]
     try:
         client = _get_carddav_client()
