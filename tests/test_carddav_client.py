@@ -116,11 +116,13 @@ def _response(body: bytes) -> DAVResponse:
 class FakeClient:
     """Stand-in for caldav.DAVClient recording calls and returning canned bodies."""
 
-    def __init__(self, propfind_bodies=None, report_bodies=None):
+    def __init__(self, propfind_bodies=None, report_bodies=None, request_responses=None):
         self._propfind_bodies = list(propfind_bodies or [])
         self._report_bodies = list(report_bodies or [])
+        self._request_responses = list(request_responses or [])
         self.propfind_calls = []
         self.report_calls = []
+        self.request_calls = []
 
     def propfind(self, url, props=None, depth=0):
         self.propfind_calls.append((url, depth))
@@ -129,6 +131,19 @@ class FakeClient:
     def report(self, url, query="", depth=0):
         self.report_calls.append((url, query, depth))
         return _response(self._report_bodies.pop(0))
+
+    def request(self, url, method="GET", body="", headers=None):
+        self.request_calls.append((url, method, body, headers))
+        return self._request_responses.pop(0)
+
+
+class FakeHttpResponse:
+    """Minimal stand-in for the subset of DAVResponse that put/delete_vcard use."""
+
+    def __init__(self, status: int, raw: str = "", headers: dict | None = None):
+        self.status = status
+        self.raw = raw
+        self.headers = headers or {}
 
 
 class DiscoverAddressbooksTests(unittest.TestCase):
@@ -197,6 +212,37 @@ class SearchAndUidLookupTests(unittest.TestCase):
         found = carddav.find_vcard_by_uid_server_side(client, BOOK_URL, "uid-joao")
         self.assertIsNotNone(found)
         self.assertIn("joao-silva.vcf", found["href"])
+
+
+class PutDeleteVcardTests(unittest.TestCase):
+    def test_put_vcard_success_returns_new_etag(self):
+        client = FakeClient(
+            request_responses=[FakeHttpResponse(201, headers={"ETag": '"new-etag"'})]
+        )
+        href = f"{BOOK_URL}joao-silva.vcf"
+        etag = carddav.put_vcard(client, href, _vcard("uid-joao", "Joao Silva"), etag='"old-etag"')
+        self.assertEqual(etag, '"new-etag"')
+        url, method, body, headers = client.request_calls[0]
+        self.assertEqual(url, href)
+        self.assertEqual(method, "PUT")
+        self.assertEqual(headers["If-Match"], '"old-etag"')
+
+    def test_put_vcard_error_raises_carddaverror(self):
+        client = FakeClient(request_responses=[FakeHttpResponse(409, raw="conflict")])
+        with self.assertRaises(carddav.CardDAVError):
+            carddav.put_vcard(client, f"{BOOK_URL}joao-silva.vcf", _vcard("uid-joao", "Joao Silva"))
+
+    def test_delete_vcard_success(self):
+        client = FakeClient(request_responses=[FakeHttpResponse(204)])
+        carddav.delete_vcard(client, f"{BOOK_URL}joao-silva.vcf", etag='"etag-1"')
+        url, method, body, headers = client.request_calls[0]
+        self.assertEqual(method, "DELETE")
+        self.assertEqual(headers["If-Match"], '"etag-1"')
+
+    def test_delete_vcard_error_raises_carddaverror(self):
+        client = FakeClient(request_responses=[FakeHttpResponse(404, raw="not found")])
+        with self.assertRaises(carddav.CardDAVError):
+            carddav.delete_vcard(client, f"{BOOK_URL}missing.vcf")
 
 
 if __name__ == "__main__":

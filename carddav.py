@@ -630,14 +630,6 @@ def find_vcard_by_uid_server_side(client, addressbook_url: str, uid: str) -> dic
     return matches[0] if matches else None
 
 
-def get_vcard(client, href: str) -> dict:
-    """GET a single vCard resource. Raises `CardDAVError` on a non-2xx status."""
-    response = client.request(href, "GET")
-    if response.status >= 300:
-        raise CardDAVError(f"GET {href} failed with HTTP {response.status}.")
-    return {"href": href, "etag": response.headers.get("ETag"), "text": response.raw}
-
-
 def put_vcard(client, href: str, vcard_text: str, etag: str | None = None) -> str | None:
     """PUT a vCard to `href`, creating or replacing it. Returns the new ETag, if any.
 
