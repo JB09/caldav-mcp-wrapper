@@ -197,6 +197,24 @@ docker compose up -d
 The image is built and published to GHCR by CI
 (`ghcr.io/jb09/caldav-mcp-wrapper:latest`).
 
+## Repository layout
+
+```
+src/
+  server.py          MCP server: CalDAV tools, auth, HTTP app (container entrypoint)
+  subscriptions.py   Read-only ICS feed subscriptions + management CLI
+scripts/
+  smoke_test.sh      Runtime MCP smoke test against a built image (run by CI)
+.github/             CI build, Dependabot config, auto-merge workflow
+Dockerfile           Image build — copies src/ flat into /app
+docker-compose.yml   Deployment (behind an authorization proxy)
+.env.example         Template for the compose environment
+requirements.txt     Python dependencies
+```
+
+Inside the image the modules live at `/app`, so commands such as
+`python subscriptions.py list` run unchanged in the container.
+
 ## Maintenance
 
 - **Dependabot** opens weekly PRs for the Python deps, the Docker base image, and
