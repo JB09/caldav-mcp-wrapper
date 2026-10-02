@@ -7,7 +7,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Application code.
-COPY server.py subscriptions.py ./
+COPY src/ ./
 
 # Run as an unprivileged user. /data holds the persisted ICS subscription pull
 # list and is created here owned by `app`: Docker seeds a fresh named volume from

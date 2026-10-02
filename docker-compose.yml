@@ -11,7 +11,7 @@ services:
     restart: unless-stopped
     # Each variable is set explicitly so exactly what the app receives is visible
     # here. Values come from the host environment / sibling `.env`. Defaults match
-    # server.py; required secrets have none and must be provided.
+    # src/server.py; required secrets have none and must be provided.
     environment:
       CALDAV_URL: ${CALDAV_URL:-https://caldav.icloud.com/}
       CALDAV_USERNAME: ${CALDAV_USERNAME:?CALDAV_USERNAME is required}

@@ -7,3 +7,6 @@ __pycache__/
 .venv/
 venv/
 *.egg-info/
+
+# Build artifacts — dependencies come from requirements.txt, never vendored wheels.
+*.whl
