@@ -10,7 +10,7 @@
 # An exact pin gives fetch-metadata a clean previous/new pair, so patch and
 # minor bumps auto-merge again while a 3.0.0 still classifies as major and
 # stays manual — same protection, correct classification.
-mcp==2.2.0
+mcp==2.3.0
 # CalDAV client — WebDAV + iCalendar over HTTP; talks to iCloud and other servers.
 caldav>=3.3.1
 # iCalendar object model used to build and parse VEVENTs.
