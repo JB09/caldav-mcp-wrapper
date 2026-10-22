@@ -12,19 +12,23 @@ at Apple's iCloud CalDAV endpoint with your Apple ID and an app-specific passwor
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
 import uuid
 from datetime import date, datetime, timedelta, timezone
+from urllib.parse import urlsplit
 
 import caldav
+from caldav.lib.http_sync import requests as caldav_http
 from icalendar import Calendar as ICalendar
 from icalendar import Event as IEvent
 
 import subscriptions
 from mcp.server.caching import CacheHint
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from starlette.requests import Request
@@ -222,6 +226,21 @@ def _calendar_kind(components: list[str]) -> str:
     return "unknown"
 
 
+def _collection_path(url: str) -> str:
+    """Return a collection URL's path, without the trailing slash, for matching.
+
+    The host is deliberately ignored. iCloud serves one account from both its
+    entry point (caldav.icloud.com) and a partition host (pNN-caldav.icloud.com),
+    and which of the two `cal.url` carries depends on the client library:
+    caldav 3.5 moved discovered calendars onto the partition host and spelled out
+    the default `:443`. Callers that stored the old form then matched nothing, so
+    every read and write addressed by URL failed while `list_calendars` — and
+    calls by display name — kept working. Every candidate comes from this one
+    account's principal, so the path alone identifies the collection.
+    """
+    return urlsplit(url).path.rstrip("/")
+
+
 def _resolve_calendar(name: str | None, component: str = "VEVENT") -> "caldav.Calendar":
     """Resolve a calendar by display name *or* URL, enforcing the allowlist.
 
@@ -247,8 +266,9 @@ def _resolve_calendar(name: str | None, component: str = "VEVENT") -> "caldav.Ca
     calendars = _get_principal().calendars()
     match = None
     if target.startswith(("http://", "https://")):
+        wanted = _collection_path(target)
         for cal in calendars:
-            if str(cal.url).rstrip("/") == target.rstrip("/"):
+            if _collection_path(str(cal.url)) == wanted:
                 match = cal
                 break
     if match is None:
@@ -528,11 +548,38 @@ SUBSCRIBE = ToolAnnotations(
     readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=True
 )
 
+# Failures a caller can act on. The MCP SDK treats any exception that is not a
+# ToolError as a crash and hands the client only `Error executing tool <name>`,
+# which made a calendar that did not resolve, an iCloud 401, and a REPORT timeout
+# look identical from the client side. These carry their own explanation — our
+# validation messages, caldav's `<Error> at '<url>', reason <HTTP status>`, the
+# HTTP client's timeout/connection text — so they are passed through. Anything
+# else is still a genuine crash and stays masked by the SDK.
+_EXPECTED_ERRORS = (ValueError, RuntimeError, caldav.error.DAVError, caldav_http.RequestException)
+
+
+def _tool_errors(fn):
+    """Re-raise expected failures as ToolError so their message reaches the client."""
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except _EXPECTED_ERRORS as exc:
+            # DAVError's text already names its class; the rest need it added.
+            detail = str(exc) if isinstance(exc, caldav.error.DAVError) else (
+                f"{type(exc).__name__}: {exc}"
+            )
+            raise ToolError(detail) from exc
+
+    return wrapper
+
 
 # --- Read tools ---------------------------------------------------------------
 
 
 @mcp.tool(annotations=READ)
+@_tool_errors
 def list_calendars(kind: str = "calendar") -> str:
     """List the collections available in the connected CalDAV account.
 
@@ -613,6 +660,7 @@ def list_calendars(kind: str = "calendar") -> str:
 
 
 @mcp.tool(annotations=READ)
+@_tool_errors
 def list_events(start: str, end: str, calendar: str | None = None) -> str:
     """List events in a calendar within a time window.
 
@@ -639,6 +687,7 @@ def list_events(start: str, end: str, calendar: str | None = None) -> str:
 
 
 @mcp.tool(annotations=READ)
+@_tool_errors
 def get_event(uid: str, calendar: str | None = None) -> str:
     """Fetch a single event by its UID.
 
@@ -666,6 +715,7 @@ def get_event(uid: str, calendar: str | None = None) -> str:
 
 
 @mcp.tool(annotations=CREATE)
+@_tool_errors
 def create_event(
     summary: str,
     start: str,
@@ -715,6 +765,7 @@ def create_event(
 
 
 @mcp.tool(annotations=DESTRUCTIVE)
+@_tool_errors
 def update_event(
     uid: str,
     calendar: str | None = None,
@@ -767,6 +818,7 @@ def update_event(
 
 
 @mcp.tool(annotations=DESTRUCTIVE)
+@_tool_errors
 def delete_event(uid: str, calendar: str | None = None) -> str:
     """Delete an event by its UID.
 
@@ -788,6 +840,7 @@ def delete_event(uid: str, calendar: str | None = None) -> str:
 
 
 @mcp.tool(annotations=SUBSCRIBE)
+@_tool_errors
 def add_subscription(name: str, url: str) -> str:
     """Subscribe to a read-only ICS calendar feed and serve it alongside the calendars.
 
@@ -840,6 +893,7 @@ def add_subscription(name: str, url: str) -> str:
 
 
 @mcp.tool(annotations=READ)
+@_tool_errors
 def list_subscriptions() -> str:
     """List the subscribed ICS feeds and their last fetch result.
 
@@ -852,6 +906,7 @@ def list_subscriptions() -> str:
 
 
 @mcp.tool(annotations=DESTRUCTIVE)
+@_tool_errors
 def remove_subscription(id_or_url: str) -> str:
     """Remove a subscribed ICS feed from the pull list.
 
